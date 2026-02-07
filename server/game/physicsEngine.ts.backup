@@ -1,0 +1,1053 @@
+import Matter from 'matter-js';
+import {
+  Track,
+  CarState,
+  PlayerInput,
+  GameEvent,
+  Vector2,
+  PHYSICS_CONSTANTS,
+} from '@shared';
+import {
+  vec2,
+  vec2Add,
+  vec2Sub,
+  vec2Scale,
+  vec2Length,
+  vec2Normalize,
+  vec2Rotate,
+  vec2Dot,
+  vec2FromAngle,
+  clamp,
+  normalizeAngle,
+  lineIntersection,
+} from '@shared';
+import { logger } from '../utils/logger';
+
+interface CarPhysicsState {
+  body: Matter.Body;
+  playerId: string;
+  input: PlayerInput | null;
+  nitroActive: boolean;
+  nitroEndTime: number;
+  nitroAmount: number; // Current nitro fuel (0-100)
+  lastCheckpoint: number;
+  lap: number;
+  passedFinishLine: boolean;
+  layer: number; // Current layer: 0 = ground, 1 = bridge, -1 = tunnel
+  // Stuck detection
+  stuckStartTime: number; // When car first got stuck (0 = not stuck)
+  lastPosition: { x: number; y: number }; // Position to check for movement
+  lastPositionTime: number; // When lastPosition was recorded
+}
+
+export class PhysicsEngine {
+  private engine: Matter.Engine;
+  private world: Matter.World;
+  private track: Track;
+  private cars: Map<string, CarPhysicsState> = new Map();
+  private walls: Matter.Body[] = [];
+  private trackElements: Map<string, Matter.Body> = new Map();
+  private pendingEvents: GameEvent[] = [];
+  private _frameCount: number = 0;
+
+  constructor(track: Track) {
+    console.log('🚀 PHYSICS ENGINE: Constructing with track:', track.name);
+    console.log('  Track has spawn elements:', track.elements?.filter(el => el.type === 'spawn')?.length || 0);
+    console.log('  Track has finish elements:', track.elements?.filter(el => el.type === 'finish')?.length || 0);
+    
+    this.track = track;
+    this.engine = Matter.Engine.create({
+      gravity: { x: 0, y: 0 },
+      // Gentler collision resolution to prevent teleporting
+      positionIterations: 6,
+      velocityIterations: 4,
+    });
+    this.world = this.engine.world;
+    
+    // Allow small penetrations before correction - reduces jitter significantly
+    // @ts-expect-error - slop exists on world but not in types
+    this.world.slop = 3;
+  }
+
+  initialize(cars: CarState[]): void {
+    this.reset();
+    
+    // Create track walls from wall elements
+    this.createWalls();
+    
+    // Create track elements (boost pads, etc.)
+    this.createTrackElements();
+    
+    // Create cars
+    for (const car of cars) {
+      this.addCar(car);
+    }
+    
+    // Set up collision handling
+    this.setupCollisionHandlers();
+  }
+
+  reset(): void {
+    Matter.World.clear(this.world, false);
+    Matter.Engine.clear(this.engine);
+    this.cars.clear();
+    this.walls = [];
+    this.trackElements.clear();
+    this.pendingEvents = [];
+  }
+
+  private createWalls(): void {
+    // Create walls from track elements
+    const wallElements = this.track.elements?.filter(el => el.type === 'wall' || el.type === 'barrier') || [];
+    
+    console.log('🏗️ WALLS: Creating walls from elements:', wallElements.length);
+    
+    for (const wallEl of wallElements) {
+      const wall = Matter.Bodies.rectangle(
+        wallEl.x + wallEl.width / 2, // Center X
+        wallEl.y + wallEl.height / 2, // Center Y
+        wallEl.width,
+        wallEl.height,
+        {
+          isStatic: true,
+          label: 'wall',
+          render: {
+            fillStyle: wallEl.type === 'barrier' ? '#8B4513' : '#666',
+            strokeStyle: '#333',
+            lineWidth: 2
+          }
+        }
+      );
+      
+      // Store layer information for collision detection
+      // @ts-expect-error - Adding custom property
+      wall.layer = wallEl.layer ?? 0;
+      
+      this.walls.push(wall);
+      Matter.World.add(this.world, wall);
+    }
+    
+    console.log('🏗️ WALLS: Created', this.walls.length, 'wall bodies');
+  }
+
+  // Helper methods to get track data from elements
+  private getSpawnPoints() {
+    return this.track.elements
+      ?.filter(el => el.type === 'spawn')
+      ?.map((el, index) => ({
+        index,
+        position: { 
+          x: el.x + el.width / 2, 
+          y: el.y + el.height / 2 
+        },
+        rotation: el.rotation || 0
+      })) || [];
+  }
+
+  private getCheckpoints() {
+    const checkpointElements = this.track.elements?.filter(el => el.type === 'checkpoint') || [];
+    // Sort by checkpointIndex to ensure proper order
+    checkpointElements.sort((a, b) => (a.checkpointIndex ?? 0) - (b.checkpointIndex ?? 0));
+    
+    return checkpointElements.map((el, index) => ({
+      id: el.id,
+      index: el.checkpointIndex ?? index,
+      position: { 
+        x: el.x + el.width / 2, 
+        y: el.y + el.height / 2 
+      },
+      width: Math.max(el.width || 100, 50), // Ensure minimum checkpoint width for detection
+      rotation: el.rotation || 0
+    }));
+  }
+
+  private getFinishLine() {
+    const finishElements = this.track.elements?.filter(el => el.type === 'finish') || [];
+    if (finishElements.length === 0) return null;
+    
+    const finishEl = finishElements[0];
+    return {
+      position: { 
+        x: finishEl.x + finishEl.width / 2, 
+        y: finishEl.y + finishEl.height / 2 
+      },
+      width: finishEl.width || 100,
+      rotation: finishEl.rotation || 0
+    };
+  }
+
+  private createWallSegment(p1: Vector2, p2: Vector2, type: string, layer: number = 0): Matter.Body {
+    const center = vec2Scale(vec2Add(p1, p2), 0.5);
+    const length = vec2Length(vec2Sub(p2, p1));
+    const angle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+    const thickness = type === 'barrier' ? 20 : 10;
+
+    const body = Matter.Bodies.rectangle(
+      center.x,
+      center.y,
+      length,
+      thickness,
+      {
+        isStatic: true,
+        label: 'wall',
+        angle: angle,
+        render: {
+          fillStyle: type === 'barrier' ? '#8B4513' : '#666',
+          strokeStyle: '#333',
+          lineWidth: 2
+        }
+      }
+    );
+
+    // Store layer information for collision detection
+    // @ts-expect-error - Adding custom property 
+    body.layer = layer;
+
+    return body;
+  }
+
+  private createTrackElements(): void {
+    for (const element of this.track.elements) {
+      let body: Matter.Body | null = null;
+      const elementLayer = element.layer ?? 0;
+
+      switch (element.type) {
+        case 'boost_pad':
+        case 'boost':
+          body = Matter.Bodies.rectangle(
+            element.position.x,
+            element.position.y,
+            element.width,
+            element.height,
+            {
+              isStatic: true,
+              isSensor: true,
+              angle: element.rotation,
+              label: `boost_${element.id}`,
+            }
+          );
+          break;
+
+        case 'oil_slick':
+        case 'oil':
+          body = Matter.Bodies.circle(
+            element.position.x,
+            element.position.y,
+            Math.max(element.width, element.height) / 2,
+            {
+              isStatic: true,
+              isSensor: true,
+              label: `oil_${element.id}`,
+            }
+          );
+          break;
+
+        case 'ramp':
+          body = Matter.Bodies.rectangle(
+            element.position.x,
+            element.position.y,
+            element.width,
+            element.height,
+            {
+              isStatic: true,
+              isSensor: true,
+              angle: element.rotation,
+              label: `ramp_${element.id}`,
+            }
+          );
+          break;
+
+        case 'ramp_up':
+          // Ramp that transitions car to layer+1
+          body = Matter.Bodies.rectangle(
+            element.position.x,
+            element.position.y,
+            element.width,
+            element.height,
+            {
+              isStatic: true,
+              isSensor: true,
+              angle: element.rotation,
+              label: `ramp_up_${element.id}`,
+            }
+          );
+          break;
+
+        case 'ramp_down':
+          // Ramp that transitions car to layer-1
+          body = Matter.Bodies.rectangle(
+            element.position.x,
+            element.position.y,
+            element.width,
+            element.height,
+            {
+              isStatic: true,
+              isSensor: true,
+              angle: element.rotation,
+              label: `ramp_down_${element.id}`,
+            }
+          );
+          break;
+
+        case 'bridge':
+          // Bridge is just a road element at layer 1 - no collision, cars drive on it
+          // The walls around it should be created as boundaries
+          break;
+
+        case 'barrier':
+        case 'tire_stack':
+          body = Matter.Bodies.rectangle(
+            element.position.x,
+            element.position.y,
+            element.width,
+            element.height,
+            {
+              isStatic: true,
+              angle: element.rotation,
+              label: `obstacle_${element.id}`,
+              friction: 0.8,
+              restitution: element.type === 'tire_stack' ? 0.6 : 0.3,
+            }
+          );
+          break;
+
+        case 'wall':
+          // Wall elements from editor
+          body = Matter.Bodies.rectangle(
+            element.x + element.width / 2,
+            element.y + element.height / 2,
+            element.width,
+            element.height,
+            {
+              isStatic: true,
+              angle: element.rotation,
+              label: `wall_element_L${elementLayer}`,
+              friction: 0.5,
+              restitution: 0.2,
+            }
+          );
+          break;
+      }
+
+      if (body) {
+        (body as unknown as { elementData: typeof element }).elementData = element;
+        (body as unknown as { layer: number }).layer = elementLayer;
+        this.trackElements.set(element.id, body);
+        Matter.World.add(this.world, body);
+      }
+    }
+  }
+
+  addCar(carState: CarState): void {
+    const body = Matter.Bodies.rectangle(
+      carState.position.x,
+      carState.position.y,
+      PHYSICS_CONSTANTS.CAR_WIDTH,
+      PHYSICS_CONSTANTS.CAR_HEIGHT,
+      {
+        angle: carState.rotation,
+        friction: PHYSICS_CONSTANTS.TIRE_FRICTION,
+        frictionAir: 0.015, // Reduced air friction for smoother movement
+        restitution: 0.3,   // Low bounce for controlled collisions
+        mass: PHYSICS_CONSTANTS.CAR_MASS / 1000,
+        label: `car_${carState.playerId}`,
+        collisionFilter: {
+          category: 0x0001,
+          mask: 0x0003, // Collide with walls and other cars
+        },
+      }
+    );
+
+    Matter.Body.setInertia(body, PHYSICS_CONSTANTS.CAR_INERTIA);
+    Matter.Body.setVelocity(body, { x: 0, y: 0 });
+    Matter.Body.setAngularVelocity(body, 0);
+
+    this.cars.set(carState.playerId, {
+      body,
+      playerId: carState.playerId,
+      input: null,
+      nitroActive: false,
+      nitroEndTime: 0,
+      nitroAmount: PHYSICS_CONSTANTS.NITRO_MAX, // Start with full nitro
+      lastCheckpoint: 0,
+      lap: 0,
+      passedFinishLine: false,
+      layer: carState.layer ?? 0, // Initialize car layer from state
+      // Stuck detection
+      stuckStartTime: 0,
+      lastPosition: { x: carState.position.x, y: carState.position.y },
+      lastPositionTime: Date.now(),
+    });
+
+    Matter.World.add(this.world, body);
+  }
+
+  removeCar(playerId: string): void {
+    const carState = this.cars.get(playerId);
+    if (carState) {
+      Matter.World.remove(this.world, carState.body);
+      this.cars.delete(playerId);
+    }
+  }
+
+  resetCar(playerId: string, position: Vector2, rotation: number): void {
+    const carState = this.cars.get(playerId);
+    if (!carState) return;
+
+    Matter.Body.setPosition(carState.body, position);
+    Matter.Body.setAngle(carState.body, rotation);
+    Matter.Body.setVelocity(carState.body, { x: 0, y: 0 });
+    Matter.Body.setAngularVelocity(carState.body, 0);
+  }
+
+  applyInput(playerId: string, input: PlayerInput): void {
+    const carState = this.cars.get(playerId);
+    if (carState) {
+      carState.input = input;
+    }
+  }
+
+  update(deltaTime: number): GameEvent[] {
+    this.pendingEvents = [];
+    this._frameCount++;
+
+    // Process inputs and apply forces
+    for (const [playerId, carState] of this.cars) {
+      this.updateCar(carState, deltaTime);
+    }
+
+    // Track position changes during physics step
+    const positionsBefore = new Map<string, { x: number; y: number; vx: number; vy: number }>();
+    for (const [playerId, carState] of this.cars) {
+      positionsBefore.set(playerId, {
+        x: carState.body.position.x,
+        y: carState.body.position.y,
+        vx: carState.body.velocity.x,
+        vy: carState.body.velocity.y,
+      });
+    }
+
+    // Step physics with scaled delta time
+    Matter.Engine.update(this.engine, deltaTime * 1000);
+
+    // Check for large position changes and log periodically
+    for (const [playerId, carState] of this.cars) {
+      const before = positionsBefore.get(playerId);
+      if (before) {
+        const dx = carState.body.position.x - before.x;
+        const dy = carState.body.position.y - before.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        
+        // Log if car moves more than 6 pixels in one step (indicates physics issue at new scale)
+        // Normal max is ~4 px/frame, so 6+ is suspicious
+        if (distance > 6) {
+          logger.log('PHYSICS_JUMP', `Car ${playerId} moved ${distance.toFixed(1)}px in one step!`, {
+            before: { x: before.x.toFixed(1), y: before.y.toFixed(1), vx: before.vx.toFixed(2), vy: before.vy.toFixed(2) },
+            after: { x: carState.body.position.x.toFixed(1), y: carState.body.position.y.toFixed(1) },
+            deltaTime: deltaTime,
+            frameCount: this._frameCount,
+          });
+        }
+      }
+
+      // Log car state every 60 frames for debugging (once per second at 60fps)
+      if (this._frameCount % 60 === 0) {
+        const { body, input } = carState;
+        const currentSpeed = Math.sqrt(body.velocity.x ** 2 + body.velocity.y ** 2);
+        const maxSpeed = input?.accelerate ? PHYSICS_CONSTANTS.MAX_SPEED : PHYSICS_CONSTANTS.MAX_SPEED * 0.7;
+        
+        logger.log('PHYSICS', `Car ${playerId}`, {
+          pos: { x: body.position.x.toFixed(1), y: body.position.y.toFixed(1) },
+          vel: { x: body.velocity.x.toFixed(2), y: body.velocity.y.toFixed(2) },
+          speed: currentSpeed.toFixed(2),
+          maxSpeed: maxSpeed.toFixed(1),
+          input: input ? { accel: input.accelerate, brake: input.brake, steer: input.steerValue } : null
+        });
+      }
+    }
+
+    // Handle wrap-around for infinite scroll tracks
+    if (this.track.wrapAround) {
+      for (const [playerId, carState] of this.cars) {
+        const { body } = carState;
+        let newX = body.position.x;
+        let newY = body.position.y;
+        let wrapped = false;
+        
+        // Wrap horizontally
+        if (body.position.x < 0) {
+          newX = this.track.width + body.position.x;
+          wrapped = true;
+        } else if (body.position.x > this.track.width) {
+          newX = body.position.x - this.track.width;
+          wrapped = true;
+        }
+        
+        // Wrap vertically
+        if (body.position.y < 0) {
+          newY = this.track.height + body.position.y;
+          wrapped = true;
+        } else if (body.position.y > this.track.height) {
+          newY = body.position.y - this.track.height;
+          wrapped = true;
+        }
+        
+        if (wrapped) {
+          Matter.Body.setPosition(body, { x: newX, y: newY });
+          logger.log('WRAP', `Car ${playerId} wrapped to (${newX.toFixed(0)}, ${newY.toFixed(0)})`);
+        }
+      }
+    }
+
+    // Stuck detection - check if car hasn't moved much while player is trying to accelerate
+    const STUCK_THRESHOLD_DISTANCE = 5; // Minimum movement in pixels over check period
+    const STUCK_CHECK_INTERVAL = 500; // Check position every 500ms
+    const STUCK_TIMEOUT = 3000; // Respawn after 3 seconds of being stuck
+    const now = Date.now();
+
+    for (const [playerId, carState] of this.cars) {
+      const { body, input, lastPosition, lastPositionTime, stuckStartTime } = carState;
+      
+      // Only check if player is trying to move (accelerating or braking)
+      const isTryingToMove = input && (input.accelerate || input.brake);
+      
+      // Check if enough time has passed since last position check
+      if (now - lastPositionTime >= STUCK_CHECK_INTERVAL) {
+        const dx = body.position.x - lastPosition.x;
+        const dy = body.position.y - lastPosition.y;
+        const distanceMoved = Math.sqrt(dx * dx + dy * dy);
+        
+        // Update last position for next check
+        carState.lastPosition = { x: body.position.x, y: body.position.y };
+        carState.lastPositionTime = now;
+        
+        if (isTryingToMove && distanceMoved < STUCK_THRESHOLD_DISTANCE) {
+          // Car is stuck
+          if (stuckStartTime === 0) {
+            // Just started being stuck
+            carState.stuckStartTime = now;
+          } else if (now - stuckStartTime >= STUCK_TIMEOUT) {
+            // Been stuck too long - respawn to last checkpoint or spawn
+            logger.log('STUCK', `Car ${playerId} stuck for ${STUCK_TIMEOUT}ms, respawning`);
+            
+            // Find respawn point - use last checkpoint or spawn
+            let respawnPoint: { position: Vector2; rotation: number } | null = null;
+            
+            // Try to find last checkpoint
+            if (carState.lastCheckpoint > 0) {
+              const checkpoints = this.getCheckpoints();
+              if (checkpoints.length > 0) {
+                const checkpoint = checkpoints[carState.lastCheckpoint - 1];
+              if (checkpoint) {
+                respawnPoint = {
+                  position: checkpoint.position,
+                  rotation: checkpoint.rotation || 0,
+                };
+              }
+            }
+            
+            // Fall back to spawn point
+            if (!respawnPoint) {
+              const spawnIndex = Array.from(this.cars.keys()).indexOf(playerId);
+              const spawnPoints = this.getSpawnPoints();
+              const spawn = spawnPoints[Math.max(0, spawnIndex) % spawnPoints.length];
+              if (spawn) {
+                respawnPoint = spawn;
+              }
+            }
+            
+            if (respawnPoint) {
+              Matter.Body.setPosition(body, respawnPoint.position);
+              Matter.Body.setAngle(body, respawnPoint.rotation);
+              Matter.Body.setVelocity(body, { x: 0, y: 0 });
+              Matter.Body.setAngularVelocity(body, 0);
+              
+              // Add respawn event
+              this.pendingEvents.push({
+                type: 'respawn',
+                playerId,
+              });
+            }
+            
+            // Reset stuck timer
+            carState.stuckStartTime = 0;
+          }
+        } else {
+          // Car moved enough - reset stuck timer
+          carState.stuckStartTime = 0;
+        }
+      }
+    }
+
+    // Validate all car positions after physics step
+    const minX = -500, maxX = this.track.width + 500;
+    const minY = -500, maxY = this.track.height + 500;
+    const maxVelocity = PHYSICS_CONSTANTS.MAX_SPEED * 3; // Allow some headroom
+    
+    for (const [playerId, carState] of this.cars) {
+      const { body } = carState;
+      const posOutOfBounds = body.position.x < minX || body.position.x > maxX || 
+                             body.position.y < minY || body.position.y > maxY;
+      const velTooHigh = Math.abs(body.velocity.x) > maxVelocity || Math.abs(body.velocity.y) > maxVelocity;
+      const hasNaN = !Number.isFinite(body.position.x) || !Number.isFinite(body.position.y) ||
+                     !Number.isFinite(body.velocity.x) || !Number.isFinite(body.velocity.y);
+      
+      if (hasNaN || posOutOfBounds || velTooHigh) {
+        logger.log('PHYSICS_ERROR', `Invalid state for ${playerId}`, {
+          pos: { x: body.position.x, y: body.position.y },
+          vel: { x: body.velocity.x, y: body.velocity.y },
+          reason: hasNaN ? 'NaN' : posOutOfBounds ? 'position_OOB' : 'velocity_too_high'
+        });
+        
+        // Reset to spawn
+        const spawnIndex = Array.from(this.cars.keys()).indexOf(playerId);
+        const spawnPoints = this.getSpawnPoints();
+        const spawn = spawnPoints[Math.max(0, spawnIndex) % spawnPoints.length];
+        if (spawn) {
+          Matter.Body.setPosition(body, spawn.position);
+          Matter.Body.setAngle(body, spawn.rotation);
+          Matter.Body.setVelocity(body, { x: 0, y: 0 });
+          Matter.Body.setAngularVelocity(body, 0);
+        }
+      }
+    }
+
+    // Check checkpoints and lap completion
+    this.checkTrackProgress();
+
+    return this.pendingEvents;
+  }
+
+  private updateCar(carState: CarPhysicsState, deltaTime: number): void {
+    const { body, input } = carState;
+    
+    if (!input) return;
+
+    // Validate body state before processing
+    if (!Number.isFinite(body.position.x) || !Number.isFinite(body.position.y)) {
+      const spawnIndex = Array.from(this.cars.keys()).indexOf(carState.playerId);
+      const spawnPoints = this.getSpawnPoints();
+      const spawn = spawnPoints[Math.max(0, spawnIndex) % spawnPoints.length];
+      if (spawn) {
+        Matter.Body.setPosition(body, spawn.position);
+        Matter.Body.setAngle(body, spawn.rotation);
+        Matter.Body.setVelocity(body, { x: 0, y: 0 });
+        Matter.Body.setAngularVelocity(body, 0);
+      }
+      return;
+    }
+
+    if (!Number.isFinite(body.velocity.x) || !Number.isFinite(body.velocity.y)) {
+      Matter.Body.setVelocity(body, { x: 0, y: 0 });
+      return;
+    }
+
+    if (!Number.isFinite(body.angle)) {
+      Matter.Body.setAngle(body, 0);
+      return;
+    }
+
+    const forward = vec2FromAngle(body.angle - Math.PI / 2);
+    const right = vec2FromAngle(body.angle);
+    const velocity = vec2(body.velocity.x, body.velocity.y);
+    const speed = vec2Length(velocity);
+
+    // Calculate forward velocity component
+    const forwardSpeed = vec2Dot(velocity, forward);
+    
+    // Determine max speed (in px/frame)
+    const maxSpeed = input.accelerate ? PHYSICS_CONSTANTS.MAX_SPEED : PHYSICS_CONSTANTS.MAX_SPEED * 0.7;
+
+    // === ACCELERATION / BRAKING ===
+    // Simple, smooth acceleration that approaches max speed asymptotically
+    let newVelX = body.velocity.x;
+    let newVelY = body.velocity.y;
+    
+    if (input.accelerate && speed < maxSpeed) {
+      // Smooth acceleration: linear falloff allows reaching near max speed
+      const speedRatio = speed / maxSpeed;
+      // Simple linear falloff - accelerates well even at higher speeds
+      const accelerationFactor = Math.max(0.15, 1 - speedRatio * 0.85);
+      
+      // Add velocity directly in the forward direction
+      let accel = PHYSICS_CONSTANTS.ENGINE_FORCE * accelerationFactor * 0.02; // Scaled for ~60fps
+      
+      // Nitro boost - check if player has nitro and is pressing boost
+      if (input.nitro && carState.nitroAmount > 0) {
+        accel *= PHYSICS_CONSTANTS.NITRO_BOOST_MULTIPLIER;
+        carState.nitroActive = true;
+        // Drain nitro
+        carState.nitroAmount = Math.max(0, carState.nitroAmount - PHYSICS_CONSTANTS.NITRO_DRAIN_RATE * deltaTime);
+      } else {
+        carState.nitroActive = false;
+        // Recharge nitro when not boosting
+        if (carState.nitroAmount < PHYSICS_CONSTANTS.NITRO_MAX) {
+          carState.nitroAmount = Math.min(PHYSICS_CONSTANTS.NITRO_MAX, carState.nitroAmount + PHYSICS_CONSTANTS.NITRO_RECHARGE_RATE * deltaTime);
+        }
+      }
+      
+      newVelX += forward.x * accel;
+      newVelY += forward.y * accel;
+    }
+    
+    if (input.brake) {
+      if (forwardSpeed > 0.2) {
+        // Braking - reduce speed proportionally for smooth stop
+        const brakeFactor = Math.max(0.9, 1 - PHYSICS_CONSTANTS.BRAKE_FORCE * 0.01);
+        newVelX *= brakeFactor;
+        newVelY *= brakeFactor;
+      } else if (forwardSpeed > -PHYSICS_CONSTANTS.MAX_REVERSE_SPEED) {
+        // Reversing - slow acceleration backwards
+        const reverseAccel = PHYSICS_CONSTANTS.REVERSE_FORCE * 0.012;
+        newVelX -= forward.x * reverseAccel;
+        newVelY -= forward.y * reverseAccel;
+      }
+    }
+    
+    // Apply velocity changes
+    if (Number.isFinite(newVelX) && Number.isFinite(newVelY)) {
+      Matter.Body.setVelocity(body, { x: newVelX, y: newVelY });
+    }
+
+    // === NATURAL DRAG ===
+    // Always apply some drag for realistic deceleration
+    const baseDrag = input.accelerate ? 0.995 : 0.985; // More drag when coasting
+    const dragFactor = baseDrag - (PHYSICS_CONSTANTS.DRAG_COEFFICIENT * speed * 0.01);
+    
+    if (speed > 0.1 && !input.accelerate) {
+      Matter.Body.setVelocity(body, {
+        x: body.velocity.x * Math.max(0.95, dragFactor),
+        y: body.velocity.y * Math.max(0.95, dragFactor),
+      });
+    }
+
+    // === STEERING ===
+    let steerInput = input.steerValue;
+    if (input.steerLeft) steerInput = -1;
+    if (input.steerRight) steerInput = 1;
+
+    // Steering only works when moving (threshold scaled for px/frame)
+    const minSpeedForSteering = 0.15;
+    if (steerInput !== 0 && speed > minSpeedForSteering) {
+      // Steering effectiveness curve: builds up from slow, peaks at medium, reduces at high speed
+      const normalizedSpeed = Math.min(speed / maxSpeed, 1);
+      // Gentler curve: reduced by speed at higher velocities for stability
+      const steerEffectiveness = normalizedSpeed * (1.5 - normalizedSpeed * 0.7) * 0.5;
+      
+      // Calculate target angular velocity
+      const turnRate = PHYSICS_CONSTANTS.MAX_STEERING_ANGLE * steerInput * steerEffectiveness;
+      const targetAngularVel = turnRate * (forwardSpeed >= 0 ? 1 : -1);
+      
+      const currentAngularVel = Number.isFinite(body.angularVelocity) ? body.angularVelocity : 0;
+      
+      // Very smooth interpolation towards target (lower = smoother)
+      const angularLerp = 0.06; // Even smoother
+      const newAngularVel = currentAngularVel + (targetAngularVel - currentAngularVel) * angularLerp;
+      
+      if (Number.isFinite(newAngularVel)) {
+        Matter.Body.setAngularVelocity(
+          body,
+          clamp(newAngularVel, -PHYSICS_CONSTANTS.MAX_ANGULAR_VELOCITY, PHYSICS_CONSTANTS.MAX_ANGULAR_VELOCITY)
+        );
+      }
+    } else if (speed > minSpeedForSteering) {
+      // Return steering to center smoothly when not steering
+      const currentAngularVel = body.angularVelocity;
+      if (Math.abs(currentAngularVel) > 0.005) {
+        Matter.Body.setAngularVelocity(body, currentAngularVel * 0.9);
+      } else {
+        Matter.Body.setAngularVelocity(body, 0);
+      }
+    } else {
+      // Very slow - no angular velocity
+      Matter.Body.setAngularVelocity(body, 0);
+    }
+
+    // === LATERAL FRICTION (GRIP) ===
+    // Almost completely eliminate sideways velocity for predictable handling
+    const lateralSpeed = vec2Dot(vec2(body.velocity.x, body.velocity.y), right);
+    let gripMultiplier: number = PHYSICS_CONSTANTS.TIRE_FRICTION;
+
+    if (input.handbrake) {
+      gripMultiplier = PHYSICS_CONSTANTS.HANDBRAKE_FRICTION;
+    }
+
+    // Apply grip by reducing lateral velocity
+    if (Math.abs(lateralSpeed) > 0.02) {
+      const currentVel = vec2(body.velocity.x, body.velocity.y);
+      const forwardComponent = vec2Scale(forward, vec2Dot(currentVel, forward));
+      const lateralComponent = vec2Scale(right, lateralSpeed);
+      
+      // Strong grip reduction of lateral component
+      const reducedLateral = vec2Scale(lateralComponent, 1 - gripMultiplier);
+      const newVel = vec2Add(forwardComponent, reducedLateral);
+      
+      if (Number.isFinite(newVel.x) && Number.isFinite(newVel.y)) {
+        Matter.Body.setVelocity(body, newVel);
+      }
+    }
+
+    // === SPEED LIMITING ===
+    // Hard cap on speed
+    const currentSpeed = vec2Length(vec2(body.velocity.x, body.velocity.y));
+    const hardMaxSpeed = maxSpeed * 1.05; // Only 5% overshoot allowed
+    
+    if (currentSpeed > hardMaxSpeed && currentSpeed > 0.001) {
+      const scale = hardMaxSpeed / currentSpeed;
+      Matter.Body.setVelocity(body, {
+        x: body.velocity.x * scale,
+        y: body.velocity.y * scale,
+      });
+    }
+
+    // === MINIMUM SPEED THRESHOLD ===
+    // Stop completely when very slow to prevent drift
+    if (speed < 0.05 && !input.accelerate && !input.brake) {
+      Matter.Body.setVelocity(body, { x: 0, y: 0 });
+      Matter.Body.setAngularVelocity(body, 0);
+    }
+  }
+
+  private setupCollisionHandlers(): void {
+    Matter.Events.on(this.engine, 'collisionStart', (event) => {
+      for (const pair of event.pairs) {
+        this.handleCollision(pair);
+      }
+    });
+  }
+
+  private handleCollision(pair: Matter.Pair): void {
+    const { bodyA, bodyB } = pair;
+    const labelA = bodyA.label || '';
+    const labelB = bodyB.label || '';
+    
+    // Get layer info from bodies
+    const layerA = (bodyA as unknown as { layer?: number }).layer ?? 0;
+    const layerB = (bodyB as unknown as { layer?: number }).layer ?? 0;
+    
+    // Log deep collisions that might cause teleportation
+    if (pair.collision.depth > 5) {
+      logger.log('COLLISION_DEEP', `Depth ${pair.collision.depth.toFixed(1)}px between ${labelA} and ${labelB}`, {
+        depth: pair.collision.depth,
+        posA: { x: bodyA.position.x.toFixed(1), y: bodyA.position.y.toFixed(1) },
+        posB: { x: bodyB.position.x.toFixed(1), y: bodyB.position.y.toFixed(1) },
+      });
+    }
+
+    // Car-to-car collision
+    if (labelA.startsWith('car_') && labelB.startsWith('car_')) {
+      const carStateA = this.cars.get(labelA.replace('car_', ''));
+      const carStateB = this.cars.get(labelB.replace('car_', ''));
+      
+      // Only collide if on same layer
+      if (carStateA && carStateB && carStateA.layer === carStateB.layer) {
+        const impulse = pair.collision.depth * 100;
+        
+        this.pendingEvents.push({
+          type: 'collision',
+          carA: labelA.replace('car_', ''),
+          carB: labelB.replace('car_', ''),
+          impulse,
+        });
+      }
+    }
+    // Car-to-wall collision
+    else if (labelA.startsWith('car_') && (labelB.startsWith('wall_') || labelB.startsWith('obstacle_'))) {
+      const carState = this.cars.get(labelA.replace('car_', ''));
+      
+      // Only collide if on same layer
+      if (carState && carState.layer === layerB) {
+        const impulse = pair.collision.depth * 80;
+        
+        this.pendingEvents.push({
+          type: 'collision',
+          carA: labelA.replace('car_', ''),
+          impulse,
+        });
+      }
+    }
+    else if ((labelA.startsWith('wall_') || labelA.startsWith('obstacle_')) && labelB.startsWith('car_')) {
+      const carState = this.cars.get(labelB.replace('car_', ''));
+      
+      // Only collide if on same layer
+      if (carState && carState.layer === layerA) {
+        const impulse = pair.collision.depth * 80;
+        
+        this.pendingEvents.push({
+          type: 'collision',
+          carA: labelB.replace('car_', ''),
+          impulse,
+        });
+      }
+    }
+    // Car-to-boost pad
+    else if (labelA.startsWith('car_') && labelB.startsWith('boost_')) {
+      this.handleBoostPad(labelA.replace('car_', ''), bodyB);
+    }
+    else if (labelA.startsWith('boost_') && labelB.startsWith('car_')) {
+      this.handleBoostPad(labelB.replace('car_', ''), bodyA);
+    }
+    // Car-to-ramp_up (transition to higher layer)
+    else if (labelA.startsWith('car_') && labelB.startsWith('ramp_up_')) {
+      this.handleRampUp(labelA.replace('car_', ''));
+    }
+    else if (labelA.startsWith('ramp_up_') && labelB.startsWith('car_')) {
+      this.handleRampUp(labelB.replace('car_', ''));
+    }
+    // Car-to-ramp_down (transition to lower layer)
+    else if (labelA.startsWith('car_') && labelB.startsWith('ramp_down_')) {
+      this.handleRampDown(labelA.replace('car_', ''));
+    }
+    else if (labelA.startsWith('ramp_down_') && labelB.startsWith('car_')) {
+      this.handleRampDown(labelB.replace('car_', ''));
+    }
+  }
+
+  private handleRampUp(playerId: string): void {
+    const carState = this.cars.get(playerId);
+    if (!carState) return;
+    
+    // Only go up if not already at max layer (2)
+    if (carState.layer < 2) {
+      carState.layer++;
+      logger.log('LAYER', `Car ${playerId} transitioned UP to layer ${carState.layer}`);
+      
+      this.pendingEvents.push({
+        type: 'layer_change',
+        playerId,
+        layer: carState.layer,
+      });
+    }
+  }
+
+  private handleRampDown(playerId: string): void {
+    const carState = this.cars.get(playerId);
+    if (!carState) return;
+    
+    // Only go down if not already at min layer (-1)
+    if (carState.layer > -1) {
+      carState.layer--;
+      logger.log('LAYER', `Car ${playerId} transitioned DOWN to layer ${carState.layer}`);
+      
+      this.pendingEvents.push({
+        type: 'layer_change',
+        playerId,
+        layer: carState.layer,
+      });
+    }
+  }
+
+  private handleBoostPad(playerId: string, boostBody: Matter.Body): void {
+    const carState = this.cars.get(playerId);
+    if (!carState) return;
+
+    const elementData = (boostBody as unknown as { elementData?: { properties?: { boostAmount?: number } } }).elementData;
+    const boostAmount = elementData?.properties?.boostAmount ?? PHYSICS_CONSTANTS.BOOST_PAD_FORCE;
+
+    // Apply boost as direct velocity addition in forward direction
+    const forward = vec2FromAngle(carState.body.angle - Math.PI / 2);
+    const currentVel = vec2(carState.body.velocity.x, carState.body.velocity.y);
+    const boostedVel = vec2Add(currentVel, vec2Scale(forward, boostAmount));
+    
+    // Cap at slightly above max speed
+    const boostedSpeed = vec2Length(boostedVel);
+    const maxBoostedSpeed = PHYSICS_CONSTANTS.MAX_SPEED * 1.2;
+    
+    if (boostedSpeed > maxBoostedSpeed) {
+      const scale = maxBoostedSpeed / boostedSpeed;
+      Matter.Body.setVelocity(carState.body, { x: boostedVel.x * scale, y: boostedVel.y * scale });
+    } else {
+      Matter.Body.setVelocity(carState.body, boostedVel);
+    }
+    
+    this.pendingEvents.push({ type: 'boost_used', playerId });
+  }
+
+  private checkTrackProgress(): void {
+    for (const [playerId, carState] of this.cars) {
+      const position = vec2(carState.body.position.x, carState.body.position.y);
+      
+      // Check checkpoints
+      this.checkCheckpoints(playerId, carState, position);
+      
+      // Check finish line
+      this.checkFinishLine(playerId, carState, position);
+    }
+  }
+
+  private checkCheckpoints(playerId: string, carState: CarPhysicsState, position: Vector2): void {
+    const expectedCheckpoint = carState.lastCheckpoint;
+    const checkpoints = this.getCheckpoints();
+    const checkpoint = checkpoints[expectedCheckpoint];
+    
+    if (!checkpoint) return;
+
+    // Simple distance check to checkpoint
+    const dist = vec2Length(vec2Sub(position, checkpoint.position));
+    const threshold = checkpoint.width / 2;
+    
+    if (dist < threshold) {
+      carState.lastCheckpoint = expectedCheckpoint + 1;
+      
+      // Player reached checkpoint
+      
+      this.pendingEvents.push({
+        type: 'checkpoint',
+        playerId,
+        checkpoint: expectedCheckpoint,
+      });
+    }
+  }
+
+  private checkFinishLine(playerId: string, carState: CarPhysicsState, position: Vector2): void {
+    const finishLine = this.getFinishLine();
+    if (!finishLine) return;
+    
+    const dist = vec2Length(vec2Sub(position, finishLine.position));
+    
+    const isNearFinish = dist < finishLine.width / 2;
+    
+    // Must pass all checkpoints first
+    const checkpoints = this.getCheckpoints();
+    const allCheckpointsPassed = carState.lastCheckpoint >= checkpoints.length;
+    
+    if (isNearFinish && allCheckpointsPassed && !carState.passedFinishLine) {
+      carState.passedFinishLine = true;
+      carState.lap++;
+      carState.lastCheckpoint = 0;
+      
+      this.pendingEvents.push({
+        type: 'lap',
+        playerId,
+        lap: carState.lap,
+        time: 0, // Will be calculated in game room
+      });
+    } else if (!isNearFinish) {
+      carState.passedFinishLine = false;
+    }
+  }
+
+  syncCarState(car: CarState): void {
+    const physicsState = this.cars.get(car.playerId);
+    if (!physicsState) return;
+
+    const { body } = physicsState;
+    
+    // Validate physics values before syncing
+    if (!Number.isFinite(body.position.x) || !Number.isFinite(body.position.y)) {
+      console.error('Physics body has invalid position:', car.playerId, body.position);
+      return;
+    }
+    
+    car.position = { x: body.position.x, y: body.position.y };
+    car.rotation = body.angle;
+    car.velocity = { x: body.velocity.x, y: body.velocity.y };
+    car.angularVelocity = body.angularVelocity;
+    car.speed = vec2Length(vec2(body.velocity.x, body.velocity.y));
+    car.steeringAngle = physicsState.input?.steerValue ?? 0;
+    car.checkpoint = physicsState.lastCheckpoint;
+    car.lap = physicsState.lap;
+    car.layer = physicsState.layer; // Sync layer to car state
+    car.nitroAmount = physicsState.nitroAmount; // Sync nitro amount
+  }
+}

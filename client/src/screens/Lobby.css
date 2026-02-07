@@ -1,0 +1,167 @@
+.lobby {
+  background: var(--color-bg);
+}
+
+.room-list-section,
+.tracks-section {
+  margin-bottom: 32px;
+}
+
+.room-list-section h2,
+.tracks-section h2 {
+  margin-bottom: 16px;
+  font-size: 20px;
+}
+
+.empty-state {
+  text-align: center;
+  padding: 48px 24px;
+  background: var(--color-bg-secondary);
+  border-radius: var(--radius-lg);
+}
+
+.empty-state p {
+  margin-bottom: 8px;
+}
+
+.room-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.room-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.room-info h3 {
+  font-size: 16px;
+  margin-bottom: 4px;
+}
+
+.track-name {
+  font-size: 14px;
+  color: var(--color-text-muted);
+  margin-bottom: 8px;
+}
+
+.room-details {
+  display: flex;
+  gap: 16px;
+}
+
+.detail {
+  font-size: 14px;
+  color: var(--color-text-muted);
+}
+
+.status-badge {
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.status-badge.waiting {
+  background: var(--color-success);
+  color: var(--color-bg);
+}
+
+.status-badge.racing {
+  background: var(--color-primary);
+  color: white;
+}
+
+.status-badge.results {
+  background: var(--color-accent);
+  color: var(--color-bg);
+}
+
+.track-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.track-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.track-preview {
+  height: 120px;
+  background: var(--color-bg-tertiary);
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.track-placeholder {
+  font-size: 48px;
+}
+
+.track-info h3 {
+  font-size: 16px;
+  margin-bottom: 4px;
+}
+
+.difficulty-badge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  text-transform: uppercase;
+  margin-top: 8px;
+}
+
+.difficulty-badge.easy {
+  background: var(--color-success);
+  color: var(--color-bg);
+}
+
+.difficulty-badge.medium {
+  background: var(--color-warning);
+  color: var(--color-bg);
+}
+
+.difficulty-badge.hard {
+  background: var(--color-primary);
+  color: white;
+}
+
+.difficulty-badge.extreme {
+  background: #9333ea;
+  color: white;
+}
+
+.track-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: auto;
+}
+
+.track-actions .btn {
+  flex: 1;
+}
+
+@media (max-width: 600px) {
+  .room-card {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  
+  .room-details {
+    flex-wrap: wrap;
+  }
+  
+  .track-list {
+    grid-template-columns: 1fr;
+  }
+}

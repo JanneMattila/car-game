@@ -1,0 +1,53 @@
+.game-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 140;
+  pointer-events: none;
+}
+
+.overlay-text {
+  font-size: 80px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 4px;
+  text-shadow: 
+    0 0 20px currentColor,
+    0 4px 40px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transform: scale(1.5);
+  transition: none;
+}
+
+.overlay-text.animate {
+  animation: overlayPop 2s ease-out forwards;
+}
+
+@keyframes overlayPop {
+  0% {
+    opacity: 0;
+    transform: scale(1.5);
+  }
+  15% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  85% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.8);
+  }
+}
+
+@media (max-width: 480px) {
+  .overlay-text {
+    font-size: 48px;
+    letter-spacing: 2px;
+  }
+}

@@ -1,0 +1,50 @@
+.game-screen {
+  padding: 0;
+  overflow: hidden;
+  width: 100vw;
+  height: 100vh;
+  position: fixed;
+  top: 0;
+  left: 0;
+}
+
+.game-container {
+  position: absolute;
+  inset: 0;
+  background: #1a1a2e;
+  width: 100vw;
+  height: 100vh;
+  min-height: 600px;
+  overflow: hidden;
+}
+
+.game-container canvas {
+  width: 100% !important;
+  height: 100% !important;
+  display: block;
+}
+
+.pause-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+
+.pause-menu {
+  min-width: 300px;
+  text-align: center;
+}
+
+.pause-menu h2 {
+  margin-bottom: 24px;
+}
+
+.pause-options {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}

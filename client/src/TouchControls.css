@@ -1,0 +1,83 @@
+.touch-controls {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 200px;
+  display: flex;
+  justify-content: space-between;
+  padding: 16px;
+  pointer-events: none;
+  z-index: 100;
+}
+
+.touch-steering,
+.touch-pedals {
+  display: flex;
+  gap: 16px;
+  pointer-events: auto;
+}
+
+.touch-btn {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  border: 3px solid rgba(255, 255, 255, 0.3);
+  background: rgba(0, 0, 0, 0.5);
+  color: white;
+  font-size: 24px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  transition: all 0.1s;
+}
+
+.touch-btn:active {
+  background: rgba(255, 255, 255, 0.3);
+  transform: scale(0.95);
+}
+
+.steer-left,
+.steer-right {
+  font-size: 32px;
+}
+
+.accelerate {
+  background: rgba(16, 185, 129, 0.5);
+  border-color: rgba(16, 185, 129, 0.8);
+}
+
+.accelerate:active {
+  background: rgba(16, 185, 129, 0.8);
+}
+
+.brake {
+  background: rgba(239, 68, 68, 0.5);
+  border-color: rgba(239, 68, 68, 0.8);
+  font-size: 14px;
+}
+
+.brake:active {
+  background: rgba(239, 68, 68, 0.8);
+}
+
+@media (min-width: 769px) {
+  .touch-controls {
+    display: none;
+  }
+}
+
+@media (max-width: 480px) {
+  .touch-btn {
+    width: 70px;
+    height: 70px;
+  }
+  
+  .touch-controls {
+    height: 150px;
+  }
+}

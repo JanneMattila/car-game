@@ -1,0 +1,43 @@
+name: Deploy to Azure
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Azure Login using Federated Identity
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update cache versions
+        shell: pwsh
+        run: ./deploy-js-update.ps1
+
+      - name: Build and deploy
+        shell: pwsh
+        run: |
+          ./deploy-to-azure.ps1 `
+            -AppName ${{ secrets.AZURE_APP_NAME }} `
+            -ResourceGroup ${{ secrets.AZURE_RESOURCE_GROUP }} `

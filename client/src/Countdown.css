@@ -1,0 +1,49 @@
+.countdown-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 150;
+}
+
+.countdown-value {
+  font-size: 150px;
+  font-weight: 900;
+  text-shadow: 
+    0 0 20px currentColor,
+    0 4px 40px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transform: scale(2);
+  transition: none;
+}
+
+.countdown-value.animate {
+  animation: countdownPop 1s ease-out forwards;
+}
+
+@keyframes countdownPop {
+  0% {
+    opacity: 0;
+    transform: scale(2);
+  }
+  20% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  80% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+}
+
+@media (max-width: 480px) {
+  .countdown-value {
+    font-size: 100px;
+  }
+}
