@@ -31,9 +31,9 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Update cache versions
-        shell: pwsh
-        run: ./deploy-js-update.ps1
+      # - name: Update cache versions
+      #   shell: pwsh
+      #   run: ./deploy-js-update.ps1
 
       - name: Build and deploy
         shell: pwsh
