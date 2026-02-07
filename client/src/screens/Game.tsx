@@ -7,6 +7,7 @@ import GameRenderer from '../game/GameRenderer';
 import GameHUD from '../components/GameHUD';
 import GameOverlay from '../components/GameOverlay';
 import Countdown from '../components/Countdown';
+import DebugOverlay from '../components/DebugOverlay';
 
 function Game() {
   const navigate = useNavigate();
@@ -86,6 +87,9 @@ function Game() {
           color="#f59e0b"
         />
       )}
+
+      {/* Debug Overlay */}
+      <DebugOverlay localPlayerId={localPlayerId} />
 
       {/* Pause Menu */}
       {isPaused && (

@@ -1,0 +1,96 @@
+.debug-overlay {
+  position: fixed;
+  top: 60px;
+  left: 10px;
+  z-index: 9999;
+  background: rgba(0, 0, 0, 0.75);
+  color: #00ff88;
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 10px 14px;
+  border-radius: 6px;
+  border: 1px solid rgba(0, 255, 136, 0.3);
+  pointer-events: none;
+  min-width: 320px;
+  max-width: 420px;
+  backdrop-filter: blur(4px);
+}
+
+.debug-overlay .debug-title {
+  color: #ffcc00;
+  font-weight: bold;
+  font-size: 13px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid rgba(255, 204, 0, 0.3);
+  padding-bottom: 4px;
+}
+
+.debug-overlay .debug-section {
+  margin-bottom: 6px;
+}
+
+.debug-overlay .debug-section-title {
+  color: #00d9ff;
+  font-weight: bold;
+  font-size: 11px;
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+
+.debug-overlay .debug-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.debug-overlay .debug-label {
+  color: #aaa;
+}
+
+.debug-overlay .debug-value {
+  color: #00ff88;
+  text-align: right;
+}
+
+.debug-overlay .debug-value.warn {
+  color: #ffcc00;
+}
+
+.debug-overlay .debug-value.error {
+  color: #ff4444;
+}
+
+.debug-overlay .debug-value.good {
+  color: #00ff88;
+}
+
+.debug-overlay .debug-hint {
+  color: #666;
+  font-size: 10px;
+  margin-top: 6px;
+  text-align: center;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  padding-top: 4px;
+}
+
+.debug-overlay .correction-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.correction-bar .bar-bg {
+  flex: 1;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.correction-bar .bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.15s ease;
+}

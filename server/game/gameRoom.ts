@@ -459,15 +459,23 @@ export class GameRoom {
     });
   }
 
-  private handleLapComplete(playerId: string, lap: number, lapTime: number): void {
+  private handleLapComplete(playerId: string, lap: number, _lapTime: number): void {
     const car = this.cars.get(playerId);
     if (!car) return;
 
     car.lap = lap;
-    car.lapTimes.push(lapTime);
     car.checkpoint = 0;
 
-    this.emit('lap_completed', { playerId, lap, lapTime });
+    // Calculate actual lap time from race elapsed time
+    // For the first lap, time since race start; for subsequent laps, time since last lap
+    const now = this.gameState.elapsedTime;
+    const previousLapTotalTime = car.lapTimes.reduce((sum, t) => sum + t, 0);
+    const actualLapTime = now - previousLapTotalTime;
+    car.lapTimes.push(actualLapTime);
+
+    console.log(`🏁 LAP COMPLETE: Player ${playerId}, lap ${lap}, lapTime ${actualLapTime}ms, total elapsed ${now}ms`);
+
+    this.emit('lap_completed', { playerId, lap, lapTime: actualLapTime });
 
     // Submit to leaderboard
     const player = this.players.get(playerId);
@@ -475,8 +483,15 @@ export class GameRoom {
       this.leaderboardManager.submitLapTime(
         this.track.id,
         player.nickname,
-        lapTime
+        actualLapTime
       );
+    }
+
+    // Check if player has completed all required laps
+    if (lap >= this.settings.lapCount) {
+      const position = this.gameState.finishedPlayers.length + 1;
+      const totalTime = this.gameState.elapsedTime;
+      this.handlePlayerFinish(playerId, position, totalTime);
     }
   }
 

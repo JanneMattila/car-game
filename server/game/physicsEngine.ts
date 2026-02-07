@@ -435,6 +435,8 @@ export class PhysicsEngine {
     if (dist < threshold) {
       carState.lastCheckpoint = expectedCheckpoint + 1;
 
+      console.log(`📍 CHECKPOINT: Player ${playerId} passed checkpoint ${expectedCheckpoint}, next: ${expectedCheckpoint + 1}/${checkpoints.length}`);
+
       this.pendingEvents.push({
         type: 'checkpoint',
         playerId,
@@ -458,6 +460,8 @@ export class PhysicsEngine {
       carState.passedFinishLine = true;
       carState.lap++;
       carState.lastCheckpoint = 0;
+
+      console.log(`🏁 FINISH LINE: Player ${playerId} crossed finish, lap ${carState.lap}, dist=${dist.toFixed(1)}`);
 
       this.pendingEvents.push({
         type: 'lap',

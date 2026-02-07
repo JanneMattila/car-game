@@ -45,6 +45,7 @@ interface PredictedState {
   rotation: number;
   vx: number;
   vy: number;
+  angularVelocity: number;
 }
 
 interface GameState {
@@ -142,6 +143,7 @@ export const useGameStore = create<GameState>((set, get) => ({
             rotation: carState.rotation,
             vx: carState.velocity.x,
             vy: carState.velocity.y,
+            angularVelocity: carState.angularVelocity ?? 0,
           },
           carSnapshot.lastInputSequence ?? snapshot.sequence
         );
@@ -377,6 +379,7 @@ export const useGameStore = create<GameState>((set, get) => ({
           rotation: carState.rotation,
           vx: carState.velocity.x,
           vy: carState.velocity.y,
+          angularVelocity: carState.angularVelocity ?? 0,
         });
       }
     }

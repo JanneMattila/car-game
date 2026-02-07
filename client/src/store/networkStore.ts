@@ -307,12 +307,99 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         useGameStore.getState().setRaceTimer(0);
         break;
 
+      case 'lap_completed': {
+        // Update the room player's lap count and best lap time
+        const lapPlayerId = message.playerId;
+        const lapTime = message.lapTime;
+        const lapNum = message.lap;
+        set(state => ({
+          room: state.room ? {
+            ...state.room,
+            players: state.room.players.map(p =>
+              p.id === lapPlayerId
+                ? {
+                    ...p,
+                    lap: lapNum,
+                    checkpointIndex: 0,
+                    bestLapTime: p.bestLapTime === null ? lapTime : Math.min(p.bestLapTime, lapTime),
+                  }
+                : p
+            ),
+          } : null,
+        }));
+        // Also update game store car's lapTimes array
+        {
+          const gameState = useGameStore.getState();
+          const car = gameState.cars.get(lapPlayerId);
+          if (car) {
+            gameState.setCarState(lapPlayerId, {
+              lapTimes: [...(car.lapTimes ?? []), lapTime],
+            });
+          }
+        }
+        break;
+      }
+
+      case 'checkpoint_passed': {
+        const cpPlayerId = message.playerId;
+        const cpIndex = message.checkpoint;
+        set(state => ({
+          room: state.room ? {
+            ...state.room,
+            players: state.room.players.map(p =>
+              p.id === cpPlayerId
+                ? { ...p, checkpointIndex: cpIndex + 1 }
+                : p
+            ),
+          } : null,
+        }));
+        break;
+      }
+
+      case 'player_finished': {
+        const finPlayerId = message.playerId;
+        set(state => ({
+          room: state.room ? {
+            ...state.room,
+            players: state.room.players.map(p =>
+              p.id === finPlayerId
+                ? { ...p, finished: true, finishTime: message.totalTime }
+                : p
+            ),
+          } : null,
+        }));
+        break;
+      }
+
       case 'game_state':
         set({ gameState: message.state });
         // Update cars in game store for interpolation
         if (message.state) {
           const { updateFromServer, setRespawning, respawning } = useGameStore.getState();
           updateFromServer(message.state);
+
+          // Sync room.players with live car data from the game state snapshot
+          // so that HUD/leaderboard always show current lap/checkpoint values
+          const currentRoom = get().room;
+          if (currentRoom && message.state.cars) {
+            const carMap = new Map(message.state.cars.map(c => [c.playerId, c]));
+            const updatedPlayers = currentRoom.players.map(p => {
+              const carSnap = carMap.get(p.id);
+              if (!carSnap) return p;
+              return {
+                ...p,
+                position: { x: carSnap.x, y: carSnap.y },
+                angle: carSnap.rotation,
+                velocity: { x: carSnap.vx, y: carSnap.vy },
+                lap: carSnap.lap,
+                checkpointIndex: carSnap.checkpoint,
+                finished: carSnap.finished,
+              };
+            });
+            set(state => ({
+              room: state.room ? { ...state.room, players: updatedPlayers } : null,
+            }));
+          }
           
           // Check for respawn events for the local player
           if (message.state.events) {

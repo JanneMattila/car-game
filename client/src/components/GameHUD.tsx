@@ -22,12 +22,25 @@ function GameHUD({ room, localPlayerId, raceTimer, showMinimap }: GameHUDProps) 
   const nitroMaxSpeed = baseMaxSpeed * PHYSICS_CONSTANTS.NITRO_BOOST_MULTIPLIER;
   const SPEED_TO_KMH = 3.6;
 
+  // Use live car data for lap/checkpoint (room.players may lag behind)
+  const currentLap = localCar?.lap ?? localPlayer?.lap ?? 0;
+  const currentCheckpoint = localCar?.checkpoint ?? localPlayer?.checkpointIndex ?? 0;
+
   // Sort players by position (lap + checkpoint progress)
+  // Prefer live car data from game store when available
   const sortedPlayers = [...room.players].sort((a, b) => {
-    if (a.finished && !b.finished) return -1;
-    if (!a.finished && b.finished) return 1;
-    if (a.lap !== b.lap) return b.lap - a.lap;
-    return b.checkpointIndex - a.checkpointIndex;
+    const carA = cars.get(a.id);
+    const carB = cars.get(b.id);
+    const aFinished = carA?.finished ?? a.finished;
+    const bFinished = carB?.finished ?? b.finished;
+    const aLap = carA?.lap ?? a.lap;
+    const bLap = carB?.lap ?? b.lap;
+    const aCp = carA?.checkpoint ?? a.checkpointIndex;
+    const bCp = carB?.checkpoint ?? b.checkpointIndex;
+    if (aFinished && !bFinished) return -1;
+    if (!aFinished && bFinished) return 1;
+    if (aLap !== bLap) return bLap - aLap;
+    return bCp - aCp;
   });
 
   const localPosition = sortedPlayers.findIndex(p => p.id === localPlayerId) + 1;
@@ -58,7 +71,7 @@ function GameHUD({ room, localPlayerId, raceTimer, showMinimap }: GameHUDProps) 
         
         <div className="lap-display">
           <span className="lap-label">LAP</span>
-          <span className="lap-current">{localPlayer?.lap || 0}</span>
+          <span className="lap-current">{currentLap}</span>
           <span className="lap-separator">/</span>
           <span className="lap-total">{room.lapCount}</span>
         </div>
