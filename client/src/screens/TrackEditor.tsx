@@ -6,6 +6,7 @@ import {
   TrackElement, 
   TrackElementType,
   DEFAULT_TRACK,
+  CURRENT_TRACK_VERSION,
 } from '@shared';
 import './TrackEditor.css';
 
@@ -196,8 +197,8 @@ function TrackEditor() {
   };
 
   const hitResizeCorner = (point: Point, element: TrackElement, tolerance = 12): string | false => {
-    // Cars cannot be resized
-    if (element.type === 'car') return false;
+    // Cars and spawn points cannot be resized
+    if (element.type === 'car' || element.type === 'spawn') return false;
     
     const rotation = element.rotation || 0;
     const cx = element.x + element.width / 2;
@@ -414,6 +415,8 @@ function TrackEditor() {
             color: '#ffff00',
             width: 2,
           });
+          // Direction arrow (shows respawn facing direction)
+          drawArrow(element, 'rgba(255, 255, 0, 0.7)');
           // Checkpoint order label
           ctx.save();
           ctx.translate(cx, cy);
@@ -473,17 +476,6 @@ function TrackEditor() {
             width: 2,
           });
           drawArrow(element, '#00ff00');
-          if (isSelected) {
-            ctx.save();
-            ctx.translate(cx, cy);
-            if (rotation) ctx.rotate(rotation);
-            ctx.fillStyle = '#ffffff';
-            ctx.fillRect(element.width / 2 - 10, element.height / 2 - 10, 12, 12);
-            ctx.strokeStyle = '#000000';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(element.width / 2 - 10, element.height / 2 - 10, 12, 12);
-            ctx.restore();
-          }
           break;
         case 'bridge':
           drawRect(element, isSelected ? 'rgba(139, 90, 43, 0.8)' : 'rgba(139, 69, 19, 0.7)', {
@@ -564,8 +556,8 @@ function TrackEditor() {
           ctx.strokeRect(-element.width / 2, -element.height / 2, element.width, element.height);
         }
         
-        // Draw resize handles for elements that can be resized (not cars)
-        if (element.type !== 'car') {
+        // Draw resize handles for elements that can be resized (not cars or spawns)
+        if (element.type !== 'car' && element.type !== 'spawn') {
           ctx.setLineDash([]);
           ctx.fillStyle = '#ffffff';
           ctx.strokeStyle = '#00ff00';
@@ -758,14 +750,14 @@ function TrackEditor() {
       }
     }
     
-    // Special case for car tool - place immediately
-    if (selectedTool === 'car') {
-      const x = snapToGrid(point.x - 15); // Center the car on the click
+    // Special case for car and spawn tools - place immediately with fixed size
+    if (selectedTool === 'car' || selectedTool === 'spawn') {
+      const x = snapToGrid(point.x - 15); // Center on the click
       const y = snapToGrid(point.y - 25);
       
       const newElement: TrackElement = {
         id: `element-${Date.now()}`,
-        type: 'car',
+        type: selectedTool,
         x,
         y,
         position: { x, y },
@@ -1213,6 +1205,59 @@ function TrackEditor() {
     }
   };
 
+  const handleExportTrack = async (trackId: string, trackName: string) => {
+    try {
+      const response = await fetch(`/api/tracks/${trackId}`);
+      if (response.ok) {
+        const trackData = await response.json();
+        const blob = new Blob([JSON.stringify(trackData, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${trackName.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } else {
+        alert('Failed to export track');
+      }
+    } catch (error) {
+      console.error('Failed to export track:', error);
+      alert('Failed to export track');
+    }
+  };
+
+  const handleImportTrack = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    input.onchange = async (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const trackData = JSON.parse(text) as Track;
+        // Validate track version
+        const fileVersion = trackData.version ?? 0;
+        if (fileVersion > CURRENT_TRACK_VERSION) {
+          alert(`Cannot import track: version ${fileVersion} is not supported. Maximum supported version is ${CURRENT_TRACK_VERSION}.`);
+          return;
+        }
+        // Assign a new ID, version, and timestamps so it's treated as a new track
+        trackData.id = `track-${Date.now()}`;
+        trackData.version = CURRENT_TRACK_VERSION;
+        trackData.createdAt = Date.now();
+        trackData.updatedAt = Date.now();
+        setTrack(trackData);
+        setSelectedElement(null);
+        setSelectedElements([]);
+      } catch (error) {
+        console.error('Failed to import track:', error);
+        alert('Failed to import track. Make sure the file is a valid track JSON.');
+      }
+    };
+    input.click();
+  };
+
   const handleCopyTrack = async (trackId: string) => {
     console.log('Copying track:', trackId);
     try {
@@ -1266,6 +1311,9 @@ function TrackEditor() {
           </button>
           <button className="btn btn-secondary" onClick={() => setShowLoadDialog(true)}>
             Load
+          </button>
+          <button className="btn btn-secondary" onClick={handleImportTrack}>
+            Import
           </button>
           <button className="btn btn-primary" onClick={handleSaveTrack}>
             Save
@@ -1831,6 +1879,12 @@ function TrackEditor() {
                       }}
                     >
                       Copy
+                    </button>
+                    <button
+                      className="btn btn-secondary btn-small"
+                      onClick={() => handleExportTrack(t.id, t.name)}
+                    >
+                      Export
                     </button>
                     {t.author !== 'System' && t.id !== 'default-oval' && (
                       <button

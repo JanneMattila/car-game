@@ -2,8 +2,12 @@
 
 import { Vector2 } from './physics';
 
+/** Current track format version supported by the system */
+export const CURRENT_TRACK_VERSION = 1;
+
 export interface Track {
   id: string;
+  version: number;
   name: string;
   author: string;
   createdAt: number;
@@ -110,6 +114,7 @@ export interface TrackValidationError {
 // Default track template with minimum required elements
 export const DEFAULT_TRACK: Track = {
   id: 'new-track',
+  version: CURRENT_TRACK_VERSION,
   name: 'New Track',
   author: 'Unknown',
   createdAt: Date.now(),
@@ -126,8 +131,8 @@ export const DEFAULT_TRACK: Track = {
       x: 180,
       y: 470,
       position: { x: 180, y: 470 },
-      width: 120,
-      height: 60,
+      width: 30,
+      height: 50,
       rotation: 0,
       layer: 0
     },

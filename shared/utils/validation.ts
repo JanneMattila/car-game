@@ -1,6 +1,6 @@
 // Validation utilities
 
-import { Track, TrackValidationResult, TrackValidationError } from '../types/track';
+import { Track, TrackValidationResult, TrackValidationError, CURRENT_TRACK_VERSION } from '../types/track';
 import { GameSettings } from '../types/game';
 import { GAME_CONSTANTS } from '../constants/game';
 import { vec2Distance } from './math';
@@ -48,7 +48,17 @@ export function validateGameSettings(settings: GameSettings): { valid: boolean; 
 export function validateTrack(track: Track): TrackValidationResult {
   const errors: TrackValidationError[] = [];
   const warnings: string[] = [];
-  
+
+  // Check track version
+  if (track.version === undefined || track.version === null) {
+    warnings.push('Track has no version number, assuming version 1');
+  } else if (track.version > CURRENT_TRACK_VERSION) {
+    errors.push({
+      code: 'UNSUPPORTED_VERSION',
+      message: `Track version ${track.version} is not supported. Maximum supported version is ${CURRENT_TRACK_VERSION}.`,
+    });
+  }
+
   // Check for required elements in the track elements array
   const finishElements = track.elements?.filter(el => el.type === 'finish') || [];
   if (finishElements.length === 0) {

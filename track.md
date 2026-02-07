@@ -9,6 +9,7 @@ This document defines the complete data structure for track files (`.json`) used
 ```json
 {
   "id": "unique-track-identifier",
+  "version": 1,
   "name": "Track Display Name",
   "author": "Track Creator Name",
   "createdAt": 1769357185458,
@@ -26,6 +27,7 @@ This document defines the complete data structure for track files (`.json`) used
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `id` | string | ✅ | Unique identifier for the track |
+| `version` | number | ✅ | Track format version (current: 1). Used to validate compatibility on import. |
 | `name` | string | ✅ | Human-readable track name |
 | `author` | string | ✅ | Track creator's name |
 | `createdAt` | number | ✅ | Unix timestamp of creation |
@@ -345,7 +347,8 @@ Creates elevation changes and jump opportunities.
 
 ## Version Compatibility
 
-- **Current Version:** Element-based system
+- **Current Version:** 1 (element-based system)
+- **Version Field:** Every track file must include a `version` field. The system checks this on import and rejects tracks with a version higher than the currently supported version.
 - **Editor:** Creates element-based tracks using modern unified element architecture
 - **Game Engine:** Supports element-based track format for optimal performance
 
