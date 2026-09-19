@@ -581,8 +581,8 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
           cameraRef.current.x = targetX;
           cameraRef.current.y = targetY;
         } else {
-          // Smooth camera follow
-          const lerpFactor = 0.1;
+          // Smooth camera follow (frame-rate-independent)
+          const lerpFactor = 1 - Math.pow(0.9, deltaTime * 60);
           cameraRef.current.x += (targetX - cameraRef.current.x) * lerpFactor;
           cameraRef.current.y += (targetY - cameraRef.current.y) * lerpFactor;
         }

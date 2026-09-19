@@ -54,6 +54,7 @@ interface PredictedState {
   rotation: number;
   vx: number;
   vy: number;
+  angularVelocity: number;
 }
 
 interface InputRecord {
@@ -78,6 +79,7 @@ interface TrackBounds {
 const pendingInputs: InputRecord[] = [];
 let lastConfirmedSequence = 0;
 let predictedState: PredictedState | null = null;
+let previousState: PredictedState | null = null; // For render interpolation
 let currentInput: InputRecord | null = null;
 let trackBounds: TrackBounds | null = null;
 
@@ -87,12 +89,6 @@ let physicsAccumulator = 0;
 
 function vec2Len(x: number, y: number): number {
   return Math.sqrt(x * x + y * y);
-}
-
-function vec2Norm(x: number, y: number): { x: number; y: number } {
-  const len = vec2Len(x, y);
-  if (len < 0.0001) return { x: 0, y: 0 };
-  return { x: x / len, y: y / len };
 }
 
 function unwrapPosition(
@@ -107,93 +103,124 @@ function unwrapPosition(
   return { x: pos.x + kx * w, y: pos.y + ky * h };
 }
 
-function simulateStep(state: PredictedState, input: InputRecord): PredictedState {
-  let { x, y, rotation, vx, vy } = state;
+// Server-matching constants for Verlet integration (mirrors clientPrediction.ts)
+const SERVER_BODY_MASS  = 1.2;           // density(0.002) × area(30×20)
+const MATTER_DT         = 1000 / 60;     // ms – same as baseDelta
+const MATTER_DT_SQUARED = MATTER_DT * MATTER_DT; // ≈ 277.78
+const MATTER_FRICTION_AIR = 1 - 0.01;    // 0.99 – body.frictionAir = 0.01
 
+function simulateStep(state: PredictedState, input: InputRecord): PredictedState {
+  let { x, y, rotation, vx, vy, angularVelocity } = state;
+
+  // Forward direction (same convention as server)
   const forwardX = Math.sin(rotation);
   const forwardY = -Math.cos(rotation);
+
+  // Speed measured at start of tick (matches server's `currentSpeed`)
   const speed = vec2Len(vx, vy);
   const forwardSpeed = vx * forwardX + vy * forwardY;
-  const maxSpeed = PHYSICS_CONSTANTS.MAX_SPEED;
+  const isMovingForward  = forwardSpeed > 0.5;
+  const isMovingBackward = forwardSpeed < -0.5;
 
-  // Acceleration / braking
-  if (input.accelerate && speed < maxSpeed) {
-    const speedRatio = speed / maxSpeed;
-    const accelerationFactor = Math.max(0.15, 1 - speedRatio * 0.85);
-    let accel = PHYSICS_CONSTANTS.ENGINE_FORCE * accelerationFactor * 0.02;
-    if (input.nitro) accel *= PHYSICS_CONSTANTS.NITRO_BOOST_MULTIPLIER;
-    vx += forwardX * accel;
-    vy += forwardY * accel;
+  // ── 1. Accumulate forces (consumed in Verlet step below) ────────
+  let forceX = 0;
+  let forceY = 0;
+
+  // Acceleration – server: applyForce( rotate((0, -ENGINE_FORCE*0.001), angle) )
+  if (input.accelerate && speed < PHYSICS_CONSTANTS.MAX_SPEED) {
+    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001;
+    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001;
   }
 
+  // Nitro boost – server: applyForce( rotate((0, -ENGINE_FORCE*0.0015), angle) )
+  if (input.nitro) {
+    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015;
+    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015;
+  }
+
+  // ── 2. Direct velocity modifications (setVelocity on server) ────
+
+  // Braking
   if (input.brake) {
-    if (forwardSpeed > 0.2) {
-      const brakeFactor = Math.max(0.9, 1 - PHYSICS_CONSTANTS.BRAKE_FORCE * 0.01);
-      vx *= brakeFactor;
-      vy *= brakeFactor;
-    } else if (forwardSpeed > -PHYSICS_CONSTANTS.MAX_REVERSE_SPEED) {
-      const reverseAccel = PHYSICS_CONSTANTS.REVERSE_FORCE * 0.012;
-      vx -= forwardX * reverseAccel;
-      vy -= forwardY * reverseAccel;
+    if (isMovingForward && forwardSpeed > 1) {
+      // Server: setVelocity(v * 0.95)
+      vx *= 0.95;
+      vy *= 0.95;
+    } else if (speed < PHYSICS_CONSTANTS.MAX_REVERSE_SPEED) {
+      // Server: reverse via applyForce
+      forceX -= forwardX * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001;
+      forceY -= forwardY * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001;
     }
   }
 
-  // Steering
-  const newSpeed = vec2Len(vx, vy);
-  if (newSpeed > 0.1) {
-    let steerInput = 0;
-    if (input.steerValue !== undefined && input.steerValue !== 0) {
-      steerInput = input.steerValue;
-    } else if (input.steerLeft) {
-      steerInput = -1;
-    } else if (input.steerRight) {
-      steerInput = 1;
-    }
-
-    if (steerInput !== 0) {
-      const speedFactor = Math.max(0.3, 1 - (newSpeed / maxSpeed) * 0.7);
-      const steerAngle = PHYSICS_CONSTANTS.MAX_STEERING_ANGLE * steerInput * speedFactor;
-      const turnRate = steerAngle * (forwardSpeed > 0 ? 1 : -1) * 0.08;
-      rotation += turnRate;
-
-      const grip = input.handbrake ? 0.85 : 0.95;
-      const currentDir = vec2Norm(vx, vy);
-      const newForwardX = Math.sin(rotation);
-      const newForwardY = -Math.cos(rotation);
-      const blendedX = currentDir.x * (1 - grip) + newForwardX * grip;
-      const blendedY = currentDir.y * (1 - grip) + newForwardY * grip;
-      const blended = vec2Norm(blendedX, blendedY);
-      vx = blended.x * newSpeed;
-      vy = blended.y * newSpeed;
-    }
+  // ── 3. Steering (angular velocity) ─────────────────────────────
+  let steerInput = 0;
+  if (input.steerValue !== undefined && input.steerValue !== 0) {
+    steerInput = input.steerValue;
+  } else if (input.steerLeft) {
+    steerInput = -1;
+  } else if (input.steerRight) {
+    steerInput = 1;
   }
 
-  // Drag — use tuned constant that approximates server's manual drag + Matter.js frictionAir
-  const dragFactor = 1 - PHYSICS_CONSTANTS.DRAG_COEFFICIENT;
+  if (steerInput !== 0) {
+    const minTurnSpeed = 0.5;
+    if (speed > minTurnSpeed) {
+      // Server's 3-tier speed factor
+      let speedFactor: number;
+      if (speed < 3) {
+        speedFactor = speed / 3;
+      } else if (speed < 15) {
+        speedFactor = 1.0;
+      } else {
+        speedFactor = Math.max(0.5, 15 / speed);
+      }
+      const turnForce = steerInput * PHYSICS_CONSTANTS.MAX_STEERING_ANGLE * 0.18 * speedFactor;
+      const reverseMult = isMovingBackward ? -1 : 1;
+      angularVelocity = turnForce * reverseMult;
+    }
+  } else {
+    // Server: setAngularVelocity(body.angularVelocity * 0.85)
+    angularVelocity *= 0.85;
+  }
+
+  // Server: angular velocity clamp
+  if (Math.abs(angularVelocity) > PHYSICS_CONSTANTS.MAX_ANGULAR_VELOCITY) {
+    angularVelocity = Math.sign(angularVelocity) * PHYSICS_CONSTANTS.MAX_ANGULAR_VELOCITY;
+  }
+
+  // ── 4. Drag (matches server: setVelocity *= (1 − drag·speed − rolling)) ─
+  const dragForce = PHYSICS_CONSTANTS.DRAG_COEFFICIENT * speed;
+  const rollingResistance = PHYSICS_CONSTANTS.ROLLING_RESISTANCE;
+  const dragFactor = 1 - dragForce - rollingResistance;
   vx *= dragFactor;
   vy *= dragFactor;
 
-  // Rolling resistance (only when not accelerating)
-  const finalSpeedCheck = vec2Len(vx, vy);
-  if (finalSpeedCheck > 0.1 && !input.accelerate) {
-    const resistFactor = 1 - PHYSICS_CONSTANTS.ROLLING_RESISTANCE;
-    vx *= resistFactor;
-    vy *= resistFactor;
+  // ── 5. Speed clamp (server uses pre-drag `speed` for comparison) ─
+  const maxSpeed = input.nitro
+    ? PHYSICS_CONSTANTS.MAX_SPEED * PHYSICS_CONSTANTS.NITRO_BOOST_MULTIPLIER
+    : PHYSICS_CONSTANTS.MAX_SPEED;
+  if (speed > maxSpeed) {
+    const ratio = maxSpeed / speed;
+    vx *= ratio;
+    vy *= ratio;
   }
 
-  // Clamp speed
-  const clampedSpeed = vec2Len(vx, vy);
-  if (clampedSpeed > maxSpeed) {
-    const scale = maxSpeed / clampedSpeed;
-    vx *= scale;
-    vy *= scale;
-  }
+  // ── 6. Verlet integration (replaces Matter.js Body.update) ──────
+  // v = v_prev × frictionAir + (F / m) × dt²
+  vx = vx * MATTER_FRICTION_AIR + (forceX / SERVER_BODY_MASS) * MATTER_DT_SQUARED;
+  vy = vy * MATTER_FRICTION_AIR + (forceY / SERVER_BODY_MASS) * MATTER_DT_SQUARED;
 
-  // Update position — NO wrapping (continuous space)
+  // Angular: angVel × frictionAir  (torque / inertia = 0 due to Infinity inertia)
+  angularVelocity *= MATTER_FRICTION_AIR;
+  rotation += angularVelocity;
+
+  // ── 7. Position update ──────────────────────────────────────────
   x += vx;
   y += vy;
 
-  return { x, y, rotation, vx, vy };
+  // Do NOT wrap — keep positions continuous for smooth camera/rendering.
+  return { x, y, rotation, vx, vy, angularVelocity };
 }
 
 function recordInput(input: InputRecord): void {
@@ -204,18 +231,25 @@ function recordInput(input: InputRecord): void {
   }
 }
 
-function predictLocalMovement(currentState: PredictedState, input: InputRecord): PredictedState {
-  const result = simulateStep(currentState, input);
-  predictedState = result;
-  return result;
-}
-
 function predictFrame(deltaTime: number = DELTA_TIME): PredictedState | null {
   if (!predictedState || !currentInput) return predictedState;
   physicsAccumulator += deltaTime;
   while (physicsAccumulator >= DELTA_TIME) {
+    previousState = { ...predictedState };
     predictedState = simulateStep(predictedState, currentInput);
     physicsAccumulator -= DELTA_TIME;
+  }
+  // Render interpolation for sub-frame smoothness
+  if (previousState && predictedState) {
+    const alpha = physicsAccumulator / DELTA_TIME;
+    return {
+      x: previousState.x + (predictedState.x - previousState.x) * alpha,
+      y: previousState.y + (predictedState.y - previousState.y) * alpha,
+      rotation: previousState.rotation + (predictedState.rotation - previousState.rotation) * alpha,
+      vx: predictedState.vx,
+      vy: predictedState.vy,
+      angularVelocity: predictedState.angularVelocity,
+    };
   }
   return predictedState;
 }
@@ -237,37 +271,60 @@ function reconcileWithServer(serverState: PredictedState, serverSequence: number
   }
 
   if (!predictedState) {
-    predictedState = target;
+    predictedState = { ...target, angularVelocity: target.angularVelocity ?? 0 };
     return predictedState;
   }
 
-  // Snap velocity & rotation, blend position (matches web client)
-  predictedState.vx = target.vx;
-  predictedState.vy = target.vy;
+  // --- Velocity: blend toward server (not hard snap) ---
+  // Matches web client: 15% correction per server update (~20 Hz)
+  const VEL_BLEND = 0.15;
+  const dvx = target.vx - predictedState.vx;
+  const dvy = target.vy - predictedState.vy;
+  predictedState.vx += dvx * VEL_BLEND;
+  predictedState.vy += dvy * VEL_BLEND;
+
+  // --- Angular velocity: blend toward server ---
+  const serverAngVel = target.angularVelocity ?? 0;
+  const angVelDelta = serverAngVel - predictedState.angularVelocity;
+  predictedState.angularVelocity += angVelDelta * VEL_BLEND;
+
+  // --- Rotation: blend toward server ---
   const rotDiff = Math.atan2(
     Math.sin(target.rotation - predictedState.rotation),
     Math.cos(target.rotation - predictedState.rotation)
   );
-  predictedState.rotation += rotDiff * 0.5;
+  predictedState.rotation += rotDiff * 0.3;
 
+  // --- Position: smooth correction ---
   const dx = target.x - predictedState.x;
   const dy = target.y - predictedState.y;
   const dist = Math.sqrt(dx * dx + dy * dy);
 
-  if (dist > 150) {
+  const SNAP_THRESHOLD = 150; // px – respawn, stuck reset, etc.
+  const BLEND_FACTOR   = 0.1; // 10% correction per server update (~20 Hz)
+
+  if (dist > SNAP_THRESHOLD) {
+    // Large discrepancy – hard snap
     predictedState.x = target.x;
     predictedState.y = target.y;
     predictedState.rotation = target.rotation;
+    predictedState.vx = target.vx;
+    predictedState.vy = target.vy;
+    predictedState.angularVelocity = target.angularVelocity ?? 0;
+    previousState = { ...predictedState }; // Reset interpolation base
   } else if (dist > 0.5) {
-    predictedState.x += dx * 0.3;
-    predictedState.y += dy * 0.3;
+    // Gradual correction
+    predictedState.x += dx * BLEND_FACTOR;
+    predictedState.y += dy * BLEND_FACTOR;
+    previousState = null; // Let next predictFrame rebuild interpolation
   }
 
   return predictedState;
 }
 
 function initializePrediction(state: PredictedState): void {
-  predictedState = { ...state };
+  predictedState = { ...state, angularVelocity: state.angularVelocity ?? 0 };
+  previousState = null;
   pendingInputs.length = 0;
   lastConfirmedSequence = 0;
   physicsAccumulator = 0;
@@ -286,6 +343,7 @@ function initializePrediction(state: PredictedState): void {
 
 function clearPrediction(): void {
   predictedState = null;
+  previousState = null;
   pendingInputs.length = 0;
   lastConfirmedSequence = 0;
   currentInput = null;
@@ -297,6 +355,7 @@ function resetPredictionVelocity(): void {
   if (predictedState) {
     predictedState.vx = 0;
     predictedState.vy = 0;
+    predictedState.angularVelocity = 0;
   }
   pendingInputs.length = 0;
 }
@@ -532,6 +591,7 @@ function updateFromServer(snapshot: GameStateSnapshot): void {
           rotation: carState.rotation,
           vx: carState.velocity.x,
           vy: carState.velocity.y,
+          angularVelocity: carState.angularVelocity ?? 0,
         },
         carSnapshot.lastInputSequence ?? snapshot.sequence
       );
@@ -676,6 +736,7 @@ function initializeCars(carSnapshots: CarStateSnapshot[]): void {
         rotation: carState.rotation,
         vx: carState.velocity.x,
         vy: carState.velocity.y,
+        angularVelocity: carState.angularVelocity ?? 0,
       });
     }
   }
@@ -723,7 +784,10 @@ function sendInputAndPredict(): void {
   const input = AUTO_DRIVE ? getAutoDriveInput() : getManualInput();
   sendMessage({ type: 'input', input });
 
-  // Record input for reconciliation (mirrors InputHandler.ts)
+  // Record input for reconciliation.
+  // The prediction loop's predictFrame() handles all physics stepping —
+  // we do NOT do prediction here to avoid double-step jitter.
+  // (Matches web client InputHandler.ts pattern.)
   const inputRecord: InputRecord = {
     sequence: input.sequence,
     timestamp: input.timestamp,
@@ -736,28 +800,6 @@ function sendInputAndPredict(): void {
     handbrake: input.handbrake,
   };
   recordInput(inputRecord);
-
-  // Apply local prediction immediately (mirrors InputHandler.ts)
-  const localCar = cars.get(playerId);
-  if (localCar) {
-    const predicted = predictLocalMovement(
-      {
-        x: localCar.displayPosition.x,
-        y: localCar.displayPosition.y,
-        rotation: localCar.displayRotation,
-        vx: localCar.velocity.x,
-        vy: localCar.velocity.y,
-      },
-      inputRecord
-    );
-
-    cars.set(playerId, {
-      ...localCar,
-      displayPosition: { x: predicted.x, y: predicted.y },
-      displayRotation: predicted.rotation,
-      velocity: { x: predicted.vx, y: predicted.vy },
-    });
-  }
 
   // Reset one-shot inputs
   if (!AUTO_DRIVE) {

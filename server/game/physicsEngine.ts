@@ -244,7 +244,17 @@ export class PhysicsEngine {
     }
 
     if (wrapped) {
+      // Save velocity before teleporting – Matter.js setPosition updates
+      // positionPrev by the same delta, but we explicitly restore velocity
+      // to guarantee no Verlet integration artefacts from the teleport.
+      const vx = body.velocity.x;
+      const vy = body.velocity.y;
+      const angVel = body.angularVelocity;
+
       Matter.Body.setPosition(body, { x, y });
+      Matter.Body.setVelocity(body, { x: vx, y: vy });
+      Matter.Body.setAngularVelocity(body, angVel);
+
       // Update last position to prevent stuck detection from triggering
       carState.lastPosition = { x, y };
     }

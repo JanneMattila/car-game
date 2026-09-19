@@ -37,6 +37,7 @@ let predictedState: PredictedState | null = null;
 let currentInput: InputRecord | null = null; // Current held input for continuous simulation
 let trackBounds: TrackBounds | null = null; // Track dimensions for wrap-around
 let physicsAccumulator = 0; // Accumulates real time, drained in fixed DELTA_TIME steps
+let previousState: PredictedState | null = null; // Previous physics state for render interpolation
 
 // Debug telemetry – readable by the debug overlay
 export interface ReconciliationDebugInfo {
@@ -148,6 +149,11 @@ export function predictLocalMovement(
  * Run one frame of prediction using current held input.
  * Uses a fixed-timestep accumulator so physics always steps at 60 Hz
  * regardless of the display refresh rate.
+ *
+ * Returns a render-interpolated state for sub-frame smoothness:
+ * after stepping, the remaining accumulator time is used to blend
+ * between the previous and current physics state, eliminating the
+ * stutter that occurs when render frames don't align with physics steps.
  */
 export function predictFrame(deltaTime: number = DELTA_TIME): PredictedState | null {
   if (!predictedState || !currentInput) return predictedState;
@@ -156,8 +162,23 @@ export function predictFrame(deltaTime: number = DELTA_TIME): PredictedState | n
   
   // Step at a fixed rate; consume all accumulated time
   while (physicsAccumulator >= DELTA_TIME) {
+    previousState = { ...predictedState };
     predictedState = simulateStep(predictedState, currentInput);
     physicsAccumulator -= DELTA_TIME;
+  }
+  
+  // Interpolate between previous and current physics state for smooth rendering.
+  // alpha = fraction of a physics step that has elapsed since the last step.
+  if (previousState && predictedState) {
+    const alpha = physicsAccumulator / DELTA_TIME;
+    return {
+      x: previousState.x + (predictedState.x - previousState.x) * alpha,
+      y: previousState.y + (predictedState.y - previousState.y) * alpha,
+      rotation: previousState.rotation + (predictedState.rotation - previousState.rotation) * alpha,
+      vx: predictedState.vx,
+      vy: predictedState.vy,
+      angularVelocity: predictedState.angularVelocity,
+    };
   }
   
   return predictedState;
@@ -391,11 +412,13 @@ export function reconcileWithServer(
     predictedState.vx = target.vx;
     predictedState.vy = target.vy;
     predictedState.angularVelocity = target.angularVelocity ?? 0;
+    previousState = { ...predictedState }; // Reset interpolation base
     _debugInfo.snapped = true;
   } else if (dist > 0.5) {
     // Gradual correction
     predictedState.x += dx * BLEND_FACTOR;
     predictedState.y += dy * BLEND_FACTOR;
+    previousState = null; // Let next predictFrame rebuild interpolation
     _debugInfo.snapped = false;
   } else {
     _debugInfo.snapped = false;
@@ -417,6 +440,7 @@ export function getPredictedState(): PredictedState | null {
  */
 export function initializePrediction(state: PredictedState): void {
   predictedState = { ...state, angularVelocity: state.angularVelocity ?? 0 };
+  previousState = null;
   pendingInputs.length = 0;
   lastConfirmedSequence = 0;
   physicsAccumulator = 0;
@@ -438,6 +462,7 @@ export function initializePrediction(state: PredictedState): void {
  */
 export function clearPrediction(): void {
   predictedState = null;
+  previousState = null;
   pendingInputs.length = 0;
   lastConfirmedSequence = 0;
   currentInput = null;
