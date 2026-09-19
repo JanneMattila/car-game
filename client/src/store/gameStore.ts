@@ -9,7 +9,7 @@ import {
   PHYSICS_CONSTANTS,
 } from '@shared';
 import { useNetworkStore } from './networkStore';
-import { vec2Lerp, lerpAngle, vec2Distance, unwrapForTrack } from '@shared';
+import { vec2Lerp, lerpAngle, vec2Distance } from '@shared';
 import { reconcileWithServer, initializePrediction, clearPrediction, predictFrame } from '../game/clientPrediction';
 
 interface InterpolatedCar extends CarState {
@@ -89,17 +89,13 @@ export const useGameStore = create<GameState>((set, get) => ({
   updateFromServer: (snapshot) => {
     const { cars: currentCars, localPlayerId, inputSequence } = get();
     const newCars = new Map<string, InterpolatedCar>();
-    const MAX_VALID_POSITION = 5000; // Track is typically <3000
 
     for (const carSnapshot of snapshot.cars) {
       const existingCar = currentCars.get(carSnapshot.playerId);
       const carState = deserializeCarState(carSnapshot, existingCar);
       const isLocalPlayer = carSnapshot.playerId === localPlayerId;
 
-      // Validate position - check for NaN, Infinity, or unreasonable values
-      const posIsInvalid = !Number.isFinite(carState.position.x) || !Number.isFinite(carState.position.y) ||
-                          Math.abs(carState.position.x) > MAX_VALID_POSITION || 
-                          Math.abs(carState.position.y) > MAX_VALID_POSITION;
+      const posIsInvalid = !Number.isFinite(carState.position.x) || !Number.isFinite(carState.position.y);
       
       if (posIsInvalid) {
         console.warn('Invalid/OOB car position from server:', {
@@ -144,19 +140,7 @@ export const useGameStore = create<GameState>((set, get) => ({
         continue;
       }
 
-      // For remote players, use interpolation
-      // For wrap-around tracks, unwrap server position relative to current display
-      // so distance checks and lerp don't jump across the wrap boundary
-      const track = useNetworkStore.getState().track;
-      let serverPos = { ...carState.position };
-      if (existingCar && track?.wrapAround) {
-        serverPos = unwrapForTrack(
-          serverPos,
-          existingCar.displayPosition,
-          track.width,
-          track.height
-        );
-      }
+      const serverPos = carState.position;
 
       const shouldSnap = existingCar 
         ? vec2Distance(existingCar.displayPosition, serverPos) > RENDER_CONSTANTS.TELEPORT_THRESHOLD
@@ -264,23 +248,9 @@ export const useGameStore = create<GameState>((set, get) => ({
         Math.min(1, rotationLerpFactor * clampedDeltaTime * 60)
       );
 
-      // Final validation - if values are invalid, keep existing
-      // Also add a hard clamp to prevent runaway positions
-      let finalPosition = (Number.isFinite(newDisplayPosition.x) && Number.isFinite(newDisplayPosition.y))
+      const finalPosition = (Number.isFinite(newDisplayPosition.x) && Number.isFinite(newDisplayPosition.y))
         ? newDisplayPosition
         : car.targetPosition;
-      
-      // Hard clamp position to reasonable world bounds
-      // With continuous (unwrapped) positions on wrap-around tracks, positions grow over laps
-      // (e.g., 100 laps × 600px = 60,000), so use a generous limit
-      const MAX_WORLD_COORD = 1000000;
-      if (Math.abs(finalPosition.x) > MAX_WORLD_COORD || Math.abs(finalPosition.y) > MAX_WORLD_COORD) {
-        console.warn('Client position exceeded world bounds, clamping:', finalPosition);
-        finalPosition = {
-          x: Math.max(-MAX_WORLD_COORD, Math.min(MAX_WORLD_COORD, finalPosition.x)),
-          y: Math.max(-MAX_WORLD_COORD, Math.min(MAX_WORLD_COORD, finalPosition.y)),
-        };
-      }
 
       updatedCars.set(playerId, {
         ...car,

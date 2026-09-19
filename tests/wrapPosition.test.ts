@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { unwrapForTrack } from '../shared/index';
 
-test('remote car stays in the nearest track copy after multiple wraps', () => {
+test('respawn selects the nearest repeated checkpoint after crossing multiple tiles', () => {
   const actual = unwrapForTrack(
     { x: 774.83, y: 164.31 },
     { x: -726.7729131647734, y: 191.3608400646777 },
@@ -13,7 +13,7 @@ test('remote car stays in the nearest track copy after multiple wraps', () => {
   assert.equal(actual.y, 164.31);
 });
 
-test('clockwise and counterclockwise circles remain continuous across both track boundaries', () => {
+test('nearest terrain-point lookup handles positive and negative tile offsets in both axes', () => {
   for (const direction of [-1, 1]) {
     for (const lapsAway of [-10, -2, 0, 2, 10]) {
       let previous = { x: lapsAway * 800 + 775, y: lapsAway * 600 + 575 };

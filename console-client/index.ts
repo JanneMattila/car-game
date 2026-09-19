@@ -46,7 +46,6 @@ import {
   vec2Lerp,
   lerpAngle,
   vec2Distance,
-  unwrapForTrack,
 } from '../shared/index.js';
 
 // ── Client-side prediction ──────────────────────────────────────────
@@ -73,19 +72,12 @@ interface InputRecord {
   handbrake: boolean;
 }
 
-interface TrackBounds {
-  width: number;
-  height: number;
-  wrapAround: boolean;
-}
-
 // Prediction state (mirrors clientPrediction.ts module state)
 const pendingInputs: InputRecord[] = [];
 let lastConfirmedSequence = 0;
 let predictedState: PredictedState | null = null;
 let previousState: PredictedState | null = null; // For render interpolation
 let currentInput: InputRecord | null = null;
-let trackBounds: TrackBounds | null = null;
 
 const DELTA_TIME = 1 / 60;
 const MAX_PENDING_INPUTS = 120;
@@ -93,14 +85,6 @@ let physicsAccumulator = 0;
 
 function vec2Len(x: number, y: number): number {
   return Math.sqrt(x * x + y * y);
-}
-
-function unwrapPosition(
-  pos: { x: number; y: number },
-  reference: { x: number; y: number }
-): { x: number; y: number } {
-  if (!trackBounds || !trackBounds.wrapAround) return pos;
-  return unwrapForTrack(pos, reference, trackBounds.width, trackBounds.height);
 }
 
 // Server-matching constants for Verlet integration (mirrors clientPrediction.ts)
@@ -260,15 +244,7 @@ function reconcileWithServer(serverState: PredictedState, serverSequence: number
   }
   lastConfirmedSequence = serverSequence;
 
-  let target = { ...serverState };
-  if (predictedState && trackBounds?.wrapAround) {
-    const unwrapped = unwrapPosition(
-      { x: target.x, y: target.y },
-      { x: predictedState.x, y: predictedState.y }
-    );
-    target.x = unwrapped.x;
-    target.y = unwrapped.y;
-  }
+  const target = serverState;
 
   if (!predictedState) {
     predictedState = { ...target, angularVelocity: target.angularVelocity ?? 0 };
@@ -347,7 +323,6 @@ function clearPrediction(): void {
   pendingInputs.length = 0;
   lastConfirmedSequence = 0;
   currentInput = null;
-  trackBounds = null;
   physicsAccumulator = 0;
 }
 
@@ -545,7 +520,6 @@ function logRaceResults(results: RaceResult[]): void {
 // ── Game state update (mirrors gameStore.ts updateFromServer) ───────
 
 function updateFromServer(snapshot: GameStateSnapshot): void {
-  const MAX_VALID_POSITION = 5000;
 
   for (const carSnapshot of snapshot.cars) {
     const existingCar = cars.get(carSnapshot.playerId);
@@ -553,9 +527,7 @@ function updateFromServer(snapshot: GameStateSnapshot): void {
     const isLocalPlayer = carSnapshot.playerId === playerId;
 
     // Validate position
-    const posIsInvalid = !Number.isFinite(carState.position.x) || !Number.isFinite(carState.position.y) ||
-      Math.abs(carState.position.x) > MAX_VALID_POSITION ||
-      Math.abs(carState.position.y) > MAX_VALID_POSITION;
+    const posIsInvalid = !Number.isFinite(carState.position.x) || !Number.isFinite(carState.position.y);
 
     if (posIsInvalid) {
       logError('Invalid car position from server', {
@@ -607,15 +579,7 @@ function updateFromServer(snapshot: GameStateSnapshot): void {
     }
 
     // Remote players: interpolation (mirrors gameStore.ts)
-    let serverPos = { ...carState.position };
-    if (existingCar && track?.wrapAround) {
-      serverPos = unwrapForTrack(
-        serverPos,
-        existingCar.displayPosition,
-        track.width,
-        track.height
-      );
-    }
+    const serverPos = carState.position;
 
     const shouldSnap = existingCar
       ? vec2Distance(existingCar.displayPosition, serverPos) > RENDER_CONSTANTS.TELEPORT_THRESHOLD
@@ -680,17 +644,9 @@ function interpolate(deltaTime: number): void {
       Math.min(1, rotationLerpFactor * clampedDeltaTime * 60)
     );
 
-    let finalPosition = (Number.isFinite(newDisplayPosition.x) && Number.isFinite(newDisplayPosition.y))
+    const finalPosition = (Number.isFinite(newDisplayPosition.x) && Number.isFinite(newDisplayPosition.y))
       ? newDisplayPosition
       : car.targetPosition;
-
-    const MAX_WORLD_COORD = 1000000;
-    if (Math.abs(finalPosition.x) > MAX_WORLD_COORD || Math.abs(finalPosition.y) > MAX_WORLD_COORD) {
-      finalPosition = {
-        x: Math.max(-MAX_WORLD_COORD, Math.min(MAX_WORLD_COORD, finalPosition.x)),
-        y: Math.max(-MAX_WORLD_COORD, Math.min(MAX_WORLD_COORD, finalPosition.y)),
-      };
-    }
 
     cars.set(pid, {
       ...car,
@@ -852,15 +808,6 @@ function handleMessage(message: ServerMessage): void {
     case 'game_starting':
       track = message.track;
       gamePhase = 'countdown';
-
-      // Set track bounds for prediction wrap-around (mirrors networkStore.ts)
-      if (track) {
-        trackBounds = {
-          width: track.width,
-          height: track.height,
-          wrapAround: track.wrapAround ?? false,
-        };
-      }
 
       logGame('Game starting!', {
         countdown: message.countdown,

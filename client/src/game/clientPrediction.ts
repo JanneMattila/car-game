@@ -1,7 +1,7 @@
 // Client-side prediction with server reconciliation
 // Provides smooth movement by predicting locally and correcting when server responds
 
-import { PHYSICS_CONSTANTS, unwrapForTrack } from '@shared';
+import { PHYSICS_CONSTANTS } from '@shared';
 
 interface PredictedState {
   x: number;
@@ -24,18 +24,11 @@ interface InputRecord {
   handbrake: boolean;
 }
 
-interface TrackBounds {
-  width: number;
-  height: number;
-  wrapAround: boolean;
-}
-
 // Store pending inputs that haven't been confirmed by server
 const pendingInputs: InputRecord[] = [];
 let lastConfirmedSequence = 0;
 let predictedState: PredictedState | null = null;
 let currentInput: InputRecord | null = null; // Current held input for continuous simulation
-let trackBounds: TrackBounds | null = null; // Track dimensions for wrap-around
 let physicsAccumulator = 0; // Accumulates real time, drained in fixed DELTA_TIME steps
 let previousState: PredictedState | null = null; // Previous physics state for render interpolation
 
@@ -76,24 +69,6 @@ const MAX_PENDING_INPUTS = 120; // ~2 seconds at 60fps
 // Helper functions
 function vec2Length(x: number, y: number): number {
   return Math.sqrt(x * x + y * y);
-}
-
-/**
- * Set the track bounds for wrap-around calculations
- */
-export function setTrackBounds(bounds: TrackBounds | null): void {
-  trackBounds = bounds;
-}
-
-// Client prediction does NOT wrap positions.
-// Positions are kept in continuous (unbounded) space so the camera can follow
-// smoothly without jumps. The tile renderer generates infinite visual tiles
-// around the camera, so the car always sees a seamless track.
-// Only the SERVER wraps positions (for physics collision checks).
-
-function unwrapPosition(pos: { x: number; y: number }, reference: { x: number; y: number }): { x: number; y: number } {
-  if (!trackBounds || !trackBounds.wrapAround) return pos;
-  return unwrapForTrack(pos, reference, trackBounds.width, trackBounds.height);
 }
 
 /**
@@ -302,8 +277,7 @@ function simulateStep(state: PredictedState, input: InputRecord): PredictedState
   x += vx;
   y += vy;
 
-  // Do NOT wrap — keep positions continuous for smooth camera/rendering.
-  // Server wraps positions; reconciliation unwraps server state to match.
+  // Both server and client use continuous world coordinates.
   return { x, y, rotation, vx, vy, angularVelocity };
 }
 
@@ -329,16 +303,7 @@ export function reconcileWithServer(
   
   lastConfirmedSequence = serverSequence;
   
-  // Unwrap server state into the same coordinate space as our current prediction
-  let target = { ...serverState };
-  if (predictedState && trackBounds?.wrapAround) {
-    const unwrapped = unwrapPosition(
-      { x: target.x, y: target.y },
-      { x: predictedState.x, y: predictedState.y }
-    );
-    target.x = unwrapped.x;
-    target.y = unwrapped.y;
-  }
+  const target = serverState;
   
   // If no prior prediction, just accept server state
   if (!predictedState) {
@@ -450,7 +415,6 @@ export function clearPrediction(): void {
   pendingInputs.length = 0;
   lastConfirmedSequence = 0;
   currentInput = null;
-  trackBounds = null;
   physicsAccumulator = 0;
 }
 

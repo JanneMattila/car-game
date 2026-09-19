@@ -110,13 +110,16 @@ new countdown automatically.
 - Each mounted game renderer owns one Pixi application and one frame callback.
   Leaving a race stops prediction immediately; cancelled asynchronous
   initialization cannot attach another canvas or restart an old loop.
-- The network game store owns car reconciliation. The renderer reads those
-  positions rather than copying wrapped room coordinates over them.
-- Browser and console clients unwrap remote positions into the nearest track
-  copy, including after multiple positive or negative wraps.
-- The renderer keeps a remote-car sprite in every visible track copy, with
-  offscreen padding. Crossing half a track from the camera does not move a
-  visible sprite to the opposite side of the screen.
+- The server, browser, and console use the same continuous world coordinates.
+  The network game store owns car reconciliation; each player has exactly one
+  car sprite at its actual world position.
+- On infinite tracks (`wrapAround`), terrain, walls, and race markers repeat.
+  Cars never wrap or appear in other tile copies. A car driving north leaves
+  a stationary observer's screen to the north and stays there until it returns.
+  The minimap shows its true direction and distance.
+- Wall physics loads neighboring tiles around each car and removes unused
+  tiles. Cars in different world tiles cannot collide through map repetition.
+  An explicit respawn selects the nearest repeated checkpoint.
 - Server physics advances in fixed 60 Hz steps based on elapsed time, with
   catch-up capped at 100 ms per callback after a long stall.
 - When validating movement, hold **ArrowUp** across track boundaries and repeat
@@ -139,9 +142,15 @@ npm run dev:console
 
 The console player readies automatically; the browser host starts the race.
 Hold **ArrowUp** with **ArrowLeft** or **ArrowRight**, switch directions, then
-brake with **ArrowDown**. Watch both cars through several turns and wrap
+brake with **ArrowDown**. Watch both cars through several turns and tile
 boundaries. Unexpected position jumps or reconciliation snaps indicate a
 movement regression.
+
+Also test with `DRIVE_PATTERN=straight` while keeping the browser player
+stationary. Let the console car cross several tile boundaries: it must leave
+the screen once and never reappear on the opposite side. Its minimap direction
+must remain consistent as its distance grows. Returning to the observer's
+actual location is the only way to come back into view.
 
 | Setting | Behavior |
 | --- | --- |
@@ -153,7 +162,7 @@ movement regression.
 
 Driving patterns apply when automatic driving is enabled (the default).
 Stop the console player with **Ctrl+C**. Run `npm test` for pattern and
-multi-wrap position regression tests.
+infinite-world physics and position regression tests.
 
 ## 📁 Project Structure
 

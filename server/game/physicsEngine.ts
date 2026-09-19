@@ -23,7 +23,7 @@ export class PhysicsEngine {
   private world: Matter.World;
   private track: Track;
   private cars: Map<string, CarPhysicsState> = new Map();
-  private walls: Matter.Body[] = [];
+  private wallTiles = new Map<string, Matter.Body[]>();
   private trackElements: Map<string, Matter.Body> = new Map();
   private pendingEvents: GameEvent[] = [];
   private _frameCount: number = 0;
@@ -47,12 +47,12 @@ export class PhysicsEngine {
 
   initialize(cars: CarState[]): void {
     this.reset();
-    this.createWalls();
     this.createTrackElements();
     
     for (const car of cars) {
       this.addCar(car);
     }
+    this.updateWallTiles();
     
     this.setupCollisionHandlers();
   }
@@ -61,19 +61,19 @@ export class PhysicsEngine {
     Matter.World.clear(this.world, false);
     Matter.Engine.clear(this.engine);
     this.cars.clear();
-    this.walls = [];
+    this.wallTiles.clear();
     this.trackElements.clear();
     this.pendingEvents = [];
   }
 
-  private createWalls(): void {
+  private createWalls(tileX: number, tileY: number): Matter.Body[] {
     const wallElements = this.track.elements?.filter(el => el.type === 'wall' || el.type === 'barrier') || [];
-    console.log('🏗️ WALLS: Creating walls from elements:', wallElements.length);
+    const walls: Matter.Body[] = [];
     
     for (const wallEl of wallElements) {
       const wall = Matter.Bodies.rectangle(
-        wallEl.x + wallEl.width / 2,
-        wallEl.y + wallEl.height / 2,
+        wallEl.x + wallEl.width / 2 + tileX * this.track.width,
+        wallEl.y + wallEl.height / 2 + tileY * this.track.height,
         wallEl.width,
         wallEl.height,
         {
@@ -90,11 +90,40 @@ export class PhysicsEngine {
       // @ts-expect-error - Adding custom property
       wall.layer = wallEl.layer ?? 0;
       
-      this.walls.push(wall);
+      walls.push(wall);
       Matter.World.add(this.world, wall);
     }
     
-    console.log('🏗️ WALLS: Created', this.walls.length, 'wall bodies');
+    return walls;
+  }
+
+  private updateWallTiles(): void {
+    const needed = new Map<string, { x: number; y: number }>();
+    if (!this.track.wrapAround) {
+      needed.set('0:0', { x: 0, y: 0 });
+    } else {
+      for (const { body } of this.cars.values()) {
+        const tileX = Math.floor(body.position.x / this.track.width);
+        const tileY = Math.floor(body.position.y / this.track.height);
+        // Neighboring terrain exists before a car reaches a tile boundary.
+        for (let x = tileX - 1; x <= tileX + 1; x++) {
+          for (let y = tileY - 1; y <= tileY + 1; y++) {
+            needed.set(`${x}:${y}`, { x, y });
+          }
+        }
+      }
+    }
+    for (const [key, tile] of needed) {
+      if (!this.wallTiles.has(key)) {
+        this.wallTiles.set(key, this.createWalls(tile.x, tile.y));
+      }
+    }
+    for (const [key, walls] of this.wallTiles) {
+      if (!needed.has(key)) {
+        for (const wall of walls) Matter.World.remove(this.world, wall);
+        this.wallTiles.delete(key);
+      }
+    }
   }
 
   private getSpawnPoints() {
@@ -202,6 +231,7 @@ export class PhysicsEngine {
   update(deltaTime: number): GameEvent[] {
     this.pendingEvents = [];
     this._frameCount++;
+    this.updateWallTiles();
 
     // Process car physics
     for (const [playerId, carState] of this.cars) {
@@ -211,53 +241,10 @@ export class PhysicsEngine {
     // Step physics engine
     Matter.Engine.update(this.engine, deltaTime * 1000);
 
-    // Apply wrap-around if enabled
-    if (this.track.wrapAround) {
-      for (const [playerId, carState] of this.cars) {
-        this.applyWrapAround(carState);
-      }
-    }
-
     // Check checkpoints and lap completion
     this.checkTrackProgress();
 
     return this.pendingEvents;
-  }
-
-  private applyWrapAround(carState: CarPhysicsState): void {
-    const { body } = carState;
-    const w = this.track.width;
-    const h = this.track.height;
-    let x = body.position.x;
-    let y = body.position.y;
-    let wrapped = false;
-
-    // Clean modulo wrap at exact track boundaries
-    // Positions always stay in [0, width) x [0, height)
-    if (x < 0 || x >= w) {
-      x = ((x % w) + w) % w;
-      wrapped = true;
-    }
-    if (y < 0 || y >= h) {
-      y = ((y % h) + h) % h;
-      wrapped = true;
-    }
-
-    if (wrapped) {
-      // Save velocity before teleporting – Matter.js setPosition updates
-      // positionPrev by the same delta, but we explicitly restore velocity
-      // to guarantee no Verlet integration artefacts from the teleport.
-      const vx = body.velocity.x;
-      const vy = body.velocity.y;
-      const angVel = body.angularVelocity;
-
-      Matter.Body.setPosition(body, { x, y });
-      Matter.Body.setVelocity(body, { x: vx, y: vy });
-      Matter.Body.setAngularVelocity(body, angVel);
-
-      // Update last position to prevent stuck detection from triggering
-      carState.lastPosition = { x, y };
-    }
   }
 
   private updateCar(carState: CarPhysicsState, deltaTime: number): void {
@@ -427,6 +414,11 @@ export class PhysicsEngine {
   private checkTrackProgress(): void {
     for (const [playerId, carState] of this.cars) {
       const position = vec2(carState.body.position.x, carState.body.position.y);
+      // Track markers repeat; the car's authoritative world position never wraps.
+      if (this.track.wrapAround) {
+        position.x = ((position.x % this.track.width) + this.track.width) % this.track.width;
+        position.y = ((position.y % this.track.height) + this.track.height) % this.track.height;
+      }
       this.checkCheckpoints(playerId, carState, position);
       this.checkFinishLine(playerId, carState, position);
     }

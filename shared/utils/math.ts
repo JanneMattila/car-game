@@ -68,7 +68,7 @@ export function vec2Clone(v: Vector2): Vector2 {
   return { x: v.x, y: v.y };
 }
 
-/** Find the track copy nearest a continuous (potentially many laps away) position. */
+/** Find the nearest copy of a repeating terrain point, such as a respawn checkpoint. */
 export function unwrapForTrack(
   position: Vector2,
   reference: Vector2,

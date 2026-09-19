@@ -197,17 +197,7 @@ function MinimapCanvas({ track, cars, players, localPlayerId }: {
     
     // Get local player position for centering
     const localCar = localPlayerId ? cars.get(localPlayerId) : null;
-    let localPos = localCar?.displayPosition || { x: track.width / 2, y: track.height / 2 };
-    
-    // For wrap-around tracks, normalize localPos to the standard track range
-    // This ensures proper relative positioning with server-sent remote player positions
-    if (track.wrapAround) {
-      const wrapCycleX = track.width;
-      const wrapCycleY = track.height;
-      let normalizedX = ((localPos.x % wrapCycleX) + wrapCycleX) % wrapCycleX;
-      let normalizedY = ((localPos.y % wrapCycleY) + wrapCycleY) % wrapCycleY;
-      localPos = { x: normalizedX, y: normalizedY };
-    }
+    const localPos = localCar?.displayPosition || { x: track.width / 2, y: track.height / 2 };
     
     // Calculate scale to show a reasonable viewport around the player
     // Show approximately 2x track size around the player for better visibility
@@ -228,21 +218,19 @@ function MinimapCanvas({ track, cars, players, localPlayerId }: {
       };
     };
     
-    // For wrap-around tracks, draw tiled elements at track dimension spacing
-    // The tiles should connect seamlessly at track.width boundaries (not wrap cycle)
-    const tileOffsets = track.wrapAround 
-      ? [
-          { x: -track.width, y: -track.height },
-          { x: 0, y: -track.height },
-          { x: track.width, y: -track.height },
-          { x: -track.width, y: 0 },
-          { x: 0, y: 0 },
-          { x: track.width, y: 0 },
-          { x: -track.width, y: track.height },
-          { x: 0, y: track.height },
-          { x: track.width, y: track.height },
-        ]
-      : [{ x: 0, y: 0 }];
+    const tileOffsets = [{ x: 0, y: 0 }];
+    if (track.wrapAround) {
+      tileOffsets.length = 0;
+      const minX = Math.floor((localPos.x - viewportSize / 2) / track.width);
+      const maxX = Math.floor((localPos.x + viewportSize / 2) / track.width);
+      const minY = Math.floor((localPos.y - viewportSize / 2) / track.height);
+      const maxY = Math.floor((localPos.y + viewportSize / 2) / track.height);
+      for (let x = minX; x <= maxX; x++) {
+        for (let y = minY; y <= maxY; y++) {
+          tileOffsets.push({ x: x * track.width, y: y * track.height });
+        }
+      }
+    }
     
     // Draw track elements for each tile
     if (track.elements && track.elements.length > 0) {
@@ -298,16 +286,6 @@ function MinimapCanvas({ track, cars, players, localPlayerId }: {
         // For remote players, calculate relative position
         relX = car.displayPosition.x - localPos.x;
         relY = car.displayPosition.y - localPos.y;
-        
-        // For wrap-around tracks, find the closest position
-        if (track.wrapAround) {
-          const wrapCycleX = track.width;
-          const wrapCycleY = track.height;
-          if (relX > wrapCycleX / 2) relX -= wrapCycleX;
-          else if (relX < -wrapCycleX / 2) relX += wrapCycleX;
-          if (relY > wrapCycleY / 2) relY -= wrapCycleY;
-          else if (relY < -wrapCycleY / 2) relY += wrapCycleY;
-        }
       }
       
       const screenX = centerOffsetX + relX * scale;

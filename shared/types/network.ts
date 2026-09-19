@@ -56,7 +56,7 @@ export interface GameStateSnapshot {
 export interface CarStateSnapshot {
   id: string;
   playerId: string;
-  x: number;
+  x: number; // Continuous world coordinates, never normalized to a track tile.
   y: number;
   rotation: number;
   vx: number;

@@ -18,7 +18,7 @@ import {
   GAME_CONSTANTS,
   PHYSICS_CONSTANTS,
 } from '@shared';
-import { generateUUID, getAvailableColor } from '@shared';
+import { generateUUID, getAvailableColor, unwrapForTrack } from '@shared';
 import { PhysicsEngine } from './physicsEngine.js';
 import { LeaderboardManager } from '../leaderboards/leaderboardManager.js';
 
@@ -645,7 +645,9 @@ export class GameRoom {
     } : null;
     
     if (checkpoint) {
-      car.position = { ...checkpoint.position };
+      car.position = this.track.wrapAround
+        ? unwrapForTrack(checkpoint.position, car.position, this.track.width, this.track.height)
+        : { ...checkpoint.position };
       car.rotation = checkpoint.rotation;
       car.velocity = { x: 0, y: 0 };
       car.angularVelocity = 0;

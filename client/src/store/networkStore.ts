@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { io, Socket } from 'socket.io-client';
 import { useGameStore } from './gameStore';
 import { debugLogger } from '../utils/debugLogger';
-import { resetPredictionVelocity, setTrackBounds } from '../game/clientPrediction';
+import { resetPredictionVelocity } from '../game/clientPrediction';
 import {
   ServerMessage,
   ClientMessage,
@@ -306,14 +306,6 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
           results: [],
           track: message.track || state.track,
         } : {});
-        // Set track bounds for client prediction wrap-around
-        if (message.track) {
-          setTrackBounds({
-            width: message.track.width,
-            height: message.track.height,
-            wrapAround: message.track.wrapAround ?? false,
-          });
-        }
         // Initialize cars from message
         if (message.cars) {
           const { initializeCars, setCountdown } = useGameStore.getState();

@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
-import { DEFAULT_GAME_SETTINGS, GAME_CONSTANTS, type Track } from '../shared/index';
+import { DEFAULT_GAME_SETTINGS, DEFAULT_INPUT_STATE, GAME_CONSTANTS, type Track } from '../shared/index';
 import { GameRoom } from '../server/game/gameRoom';
 import { LeaderboardManager } from '../server/leaderboards/leaderboardManager';
 import { StorageService } from '../server/storage/storageService';
 
-function createRoom(t: TestContext, finishAutomatically = true) {
+function createRoom(t: TestContext, finishAutomatically = true, keepCheckpoint = false) {
   t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 10000 });
   const leaderboard = new LeaderboardManager(new StorageService('unused-test-storage'));
   t.mock.method(leaderboard, 'submitLapTime', async () => ({ rank: 1, isNewRecord: true }));
@@ -58,7 +58,8 @@ function createRoom(t: TestContext, finishAutomatically = true) {
     ],
   };
   if (!finishAutomatically) {
-    track.elements = track.elements.filter(element => element.type === 'spawn');
+    track.elements = track.elements.filter(element =>
+      element.type === 'spawn' || (keepCheckpoint && element.type === 'checkpoint'));
     track.wrapAround = true;
   }
   const room = new GameRoom(
@@ -123,8 +124,8 @@ test('rematches still require ready players and preserve results on rejected sta
   assert.equal(room.startGame(), true);
 });
 
-function startDrivingRace(t: TestContext) {
-  const room = createRoom(t, false);
+function startDrivingRace(t: TestContext, keepCheckpoint = false) {
+  const room = createRoom(t, false, keepCheckpoint);
   room.setPlayerReady('host', true);
   room.startGame();
   for (let i = 0; i < GAME_CONSTANTS.COUNTDOWN_SECONDS; i++) t.mock.timers.tick(1000);
@@ -144,6 +145,19 @@ function startDrivingRace(t: TestContext) {
   });
   return room;
 }
+
+test('respawning after long-distance driving stays near the current world tile', t => {
+  const room = startDrivingRace(t, true);
+  for (let frame = 0; frame < 900; frame++) t.mock.timers.tick(GAME_CONSTANTS.PHYSICS_DELTA);
+  const before = { ...room.getCar('host')!.position };
+  assert.ok(before.y < -10000);
+  room.handleInput('host', { ...DEFAULT_INPUT_STATE, sequence: 2, timestamp: Date.now() });
+  room.handleRespawn('host');
+  const expected = { x: 150, y: 150 + Math.round((before.y - 150) / 600) * 600 };
+  assert.deepEqual(room.getCar('host')!.position, expected);
+  t.mock.timers.tick(GAME_CONSTANTS.PHYSICS_DELTA * 2);
+  assert.deepEqual(room.getCar('host')!.position, expected, 'physics retains the world-space respawn');
+});
 
 test('acceleration covers the same distance when server timer callbacks arrive late', async t => {
   const positions: number[] = [];

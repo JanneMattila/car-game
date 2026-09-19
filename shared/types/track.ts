@@ -16,7 +16,7 @@ export interface Track {
   defaultLapCount: number;
   width: number;
   height: number;
-  // Infinite scroll: when enabled, cars wrap around to opposite edge
+  // Infinite terrain repeats; cars retain continuous world coordinates.
   wrapAround?: boolean;
   elements: TrackElement[];
   scenery: SceneryItem[];
