@@ -45,6 +45,8 @@ export class GameRoom {
   private gameLoop: NodeJS.Timeout | null = null;
   private broadcastLoop: NodeJS.Timeout | null = null;
   private countdownTimer: NodeJS.Timeout | null = null;
+  private lastPhysicsUpdateTime = 0;
+  private physicsAccumulator = 0;
   
   private eventListeners: RoomEventListener[] = [];
   private pendingEvents: GameEvent[] = [];
@@ -330,6 +332,8 @@ export class GameRoom {
     this.gameState.phase = 'racing';
     this.gameState.raceStartTime = Date.now();
     this.startedAt = Date.now();
+    this.lastPhysicsUpdateTime = this.gameState.raceStartTime;
+    this.physicsAccumulator = 0;
 
     this.emit('game_started', { startTime: this.gameState.raceStartTime });
 
@@ -409,25 +413,23 @@ export class GameRoom {
 
     const now = Date.now();
     this.gameState.elapsedTime = now - this.gameState.raceStartTime;
+    // Timer callbacks are not a simulation clock. Catch up in fixed steps, with
+    // the same 100ms stall limit as client prediction to avoid runaway catch-up.
+    this.physicsAccumulator += Math.min(100, Math.max(0, now - this.lastPhysicsUpdateTime));
+    this.lastPhysicsUpdateTime = now;
 
-    // Update physics
-    const events = this.physics.update(GAME_CONSTANTS.PHYSICS_DELTA / 1000);
-    
-    // Process physics events
-    for (const event of events) {
-      this.handlePhysicsEvent(event);
+    while (this.physicsAccumulator >= GAME_CONSTANTS.PHYSICS_DELTA && this.state === 'racing') {
+      this.physicsAccumulator -= GAME_CONSTANTS.PHYSICS_DELTA;
+      const events = this.physics.update(GAME_CONSTANTS.PHYSICS_DELTA / 1000);
+      for (const event of events) {
+        this.handlePhysicsEvent(event);
+      }
+      for (const car of this.cars.values()) {
+        this.physics.syncCarState(car);
+      }
+      this.updateRankings();
+      this.checkRaceCompletion();
     }
-
-    // Update car states from physics
-    for (const car of this.cars.values()) {
-      this.physics.syncCarState(car);
-    }
-
-    // Update positions/rankings
-    this.updateRankings();
-
-    // Check for race completion
-    this.checkRaceCompletion();
   }
 
   private handlePhysicsEvent(event: GameEvent): void {

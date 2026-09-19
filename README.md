@@ -105,6 +105,19 @@ new countdown automatically.
 - TypeScript compilation happens in real-time
 - Shared types ensure client-server consistency
 
+### Gameplay Timing
+
+- Each mounted game renderer owns one Pixi application and one frame callback.
+  Leaving a race stops prediction immediately; cancelled asynchronous
+  initialization cannot attach another canvas or restart an old loop.
+- The network game store owns car reconciliation. The renderer reads those
+  positions rather than copying wrapped room coordinates over them.
+- Server physics advances in fixed 60 Hz steps based on elapsed time, with
+  catch-up capped at 100 ms per callback after a long stall.
+- When validating movement, hold **ArrowUp** across track boundaries and repeat
+  after **Play Again** and leaving/rejoining. Normal driving should not trigger
+  large backward jumps or `[SNAP]` corrections in the **B** debug overlay.
+
 ## 📁 Project Structure
 
 ```
@@ -161,7 +174,7 @@ car-game/
 - `npm start` - Start the production server (requires build first)
 
 ### Code Quality
-- `npm test` - Run race lifecycle regression tests
+- `npm test` - Run race lifecycle, delayed physics timer, and async renderer cleanup regression tests
 - `npm run lint` - Run ESLint on all TypeScript files
 - `npm run lint:fix` - Fix ESLint issues automatically
 - `npm run format` - Format code with Prettier

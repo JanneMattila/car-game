@@ -5,7 +5,7 @@ import { GameRoom } from '../server/game/gameRoom';
 import { LeaderboardManager } from '../server/leaderboards/leaderboardManager';
 import { StorageService } from '../server/storage/storageService';
 
-function createRoom(t: TestContext) {
+function createRoom(t: TestContext, finishAutomatically = true) {
   t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 10000 });
   const leaderboard = new LeaderboardManager(new StorageService('unused-test-storage'));
   t.mock.method(leaderboard, 'submitLapTime', async () => ({ rank: 1, isNewRecord: true }));
@@ -57,6 +57,10 @@ function createRoom(t: TestContext) {
       },
     ],
   };
+  if (!finishAutomatically) {
+    track.elements = track.elements.filter(element => element.type === 'spawn');
+    track.wrapAround = true;
+  }
   const room = new GameRoom(
     'room',
     'ABCDEF',
@@ -117,4 +121,67 @@ test('rematches still require ready players and preserve results on rejected sta
   assert.deepEqual(room.getResults(), results);
   room.setPlayerReady('host', true);
   assert.equal(room.startGame(), true);
+});
+
+function startDrivingRace(t: TestContext) {
+  const room = createRoom(t, false);
+  room.setPlayerReady('host', true);
+  room.startGame();
+  for (let i = 0; i < GAME_CONSTANTS.COUNTDOWN_SECONDS; i++) t.mock.timers.tick(1000);
+  t.mock.timers.tick(500);
+  assert.equal(room.getState(), 'racing');
+  room.handleInput('host', {
+    sequence: 1,
+    timestamp: Date.now(),
+    accelerate: true,
+    brake: false,
+    steerLeft: false,
+    steerRight: false,
+    steerValue: 0,
+    nitro: false,
+    handbrake: false,
+    respawn: false,
+  });
+  return room;
+}
+
+test('acceleration covers the same distance when server timer callbacks arrive late', async t => {
+  const positions: number[] = [];
+  for (const callbacks of [60, 40, 20]) {
+    await t.test(`${callbacks} timer callbacks per second`, t => {
+      const room = startDrivingRace(t);
+      const start = Date.now();
+      let now = start;
+      t.mock.method(Date, 'now', () => now);
+      for (let i = 1; i <= callbacks; i++) {
+        now = start + i * 1000 / callbacks;
+        t.mock.timers.tick(GAME_CONSTANTS.PHYSICS_DELTA);
+      }
+      positions.push(room.getCar('host')!.position.y);
+    });
+  }
+  for (const position of positions.slice(1)) {
+    assert.ok(
+      Math.abs(position - positions[0]!) < 15,
+      `timer delay changed distance by ${Math.abs(position - positions[0]!)}px (more than one physics step)`
+    );
+  }
+});
+
+test('long server stalls catch up at most 100ms without leaving a simulation backlog', async t => {
+  const positions: number[] = [];
+  for (const stall of [100, 5000]) {
+    await t.test(`${stall}ms stall`, t => {
+      const room = startDrivingRace(t);
+      const now = Date.now() + stall;
+      t.mock.method(Date, 'now', () => now);
+      t.mock.timers.tick(GAME_CONSTANTS.PHYSICS_DELTA);
+      const position = room.getCar('host')!.position.y;
+      positions.push(position);
+      t.mock.timers.tick(GAME_CONSTANTS.PHYSICS_DELTA);
+      assert.equal(room.getCar('host')!.position.y, position, 'no elapsed time means no extra movement');
+      assert.equal(room.getGameState().elapsedTime, stall);
+    });
+  }
+  assert.equal(positions[0], positions[1]);
 });

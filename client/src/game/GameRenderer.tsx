@@ -4,12 +4,7 @@ import { RoomInfo, CarState, CAR_COLORS, Track, CarColor, PHYSICS_CONSTANTS } fr
 import { useGameStore } from '../store/gameStore';
 import { useNetworkStore } from '../store/networkStore';
 import { debugLogger } from '../utils/debugLogger';
-
-// Module-level tracker to survive React strict mode cleanup/remount cycles
-let moduleApp: PIXI.Application | null = null;
-let moduleTrackContainer: PIXI.Container | null = null;
-let cleanupTimeoutId: number | null = null;
-let moduleInitializing = false; // Sync flag set BEFORE async work
+import { startRendererSession } from './rendererSession';
 
 interface GameRendererProps {
   containerRef: React.RefObject<HTMLDivElement>;
@@ -19,8 +14,7 @@ interface GameRendererProps {
 
 function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) {
   const appRef = useRef<PIXI.Application | null>(null);
-  const isInitializingRef = useRef(false);
-  const isDestroyedRef = useRef(false); // Guard against render after cleanup
+  const renderLoopRef = useRef<() => void>(() => {});
   const carsRef = useRef<Map<string, PIXI.Container>>(new Map());
   const trackContainerRef = useRef<PIXI.Container | null>(null);
   const tireMarksContainerRef = useRef<PIXI.Container | null>(null);
@@ -44,257 +38,81 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
 
   // Initialize PIXI
   useEffect(() => {
-    if (!containerRef.current) return;
-    
-    // Cancel any pending cleanup from strict mode
-    if (cleanupTimeoutId !== null) {
-      clearTimeout(cleanupTimeoutId);
-      cleanupTimeoutId = null;
-      // Cancelled pending cleanup (strict mode remount)
-    }
-    
-    // If we already have a module-level app, reuse it
-    if (moduleApp && moduleTrackContainer) {
-      // Reusing existing PIXI app
-      appRef.current = moduleApp;
-      trackContainerRef.current = moduleTrackContainer;
-      isDestroyedRef.current = false;
-      
-      // Re-add canvas if needed
-      if (!containerRef.current.contains(moduleApp.canvas)) {
-        containerRef.current.appendChild(moduleApp.canvas);
-      }
-      
-      // Re-add render loop
-      moduleApp.ticker.add(renderLoop);
-      setPixiReady(true);
-      
-      if (!moduleApp.ticker.started) {
-        moduleApp.ticker.start();
-      }
-      return;
-    }
-    
-    // Check module-level initializing flag (survives React strict mode)
-    // If another instance is initializing, wait for it
-    if (moduleInitializing && !moduleApp) {
-      // Module initializing elsewhere, waiting...
-      const waitForApp = setInterval(() => {
-        if (moduleApp && moduleTrackContainer) {
-          clearInterval(waitForApp);
-          // Module app ready, using it
-          appRef.current = moduleApp;
-          trackContainerRef.current = moduleTrackContainer;
-          isDestroyedRef.current = false;
-          
-          if (!containerRef.current!.contains(moduleApp.canvas)) {
-            containerRef.current!.appendChild(moduleApp.canvas);
-          }
-          
-          moduleApp.ticker.add(renderLoop);
-          setPixiReady(true);
-          
-          if (!moduleApp.ticker.started) {
-            moduleApp.ticker.start();
-          }
-        }
-      }, 50);
-      return () => clearInterval(waitForApp);
-    }
-    
-    if (isInitializingRef.current) return;
-    
-    // Set BOTH flags before any async work
-    moduleInitializing = true;
-    isInitializingRef.current = true;
-    isDestroyedRef.current = false;
-
+    const container = containerRef.current;
+    if (!container) return;
+    setPixiReady(false);
     const app = new PIXI.Application();
-    
-    const initApp = async () => {
-      // Use full viewport dimensions to prevent clipping
-      const containerWidth = Math.max(containerRef.current!.clientWidth || 800, window.innerWidth);
-      const containerHeight = Math.max(containerRef.current!.clientHeight || 600, window.innerHeight);
-      
-      // Initializing canvas
-      
-      await app.init({
-        width: containerWidth,
-        height: containerHeight,
-        backgroundColor: 0x1a1a2e, // Dark blue background
+    const onTick = () => renderLoopRef.current();
+    let resizeFrame: number | null = null;
+    const handleResize = () => {
+      const rect = container.getBoundingClientRect();
+      const width = rect.width || window.innerWidth;
+      const height = rect.height || window.innerHeight;
+      if (app.screen.width !== width || app.screen.height !== height) {
+        app.renderer.resize(width, height);
+      }
+    };
+    const scheduleResize = () => {
+      if (resizeFrame !== null) return;
+      resizeFrame = requestAnimationFrame(() => {
+        resizeFrame = null;
+        handleResize();
+      });
+    };
+    const resizeObserver = new ResizeObserver(scheduleResize);
+
+    return startRendererSession({
+      initialize: () => app.init({
+        width: container.clientWidth || window.innerWidth,
+        height: container.clientHeight || window.innerHeight,
+        backgroundColor: 0x1a1a2e,
         antialias: true,
         resolution: window.devicePixelRatio || 1,
         autoDensity: true,
-        autoStart: false, // Don't start ticker until scene is ready
-      });
-
-      // Canvas created
-      containerRef.current!.appendChild(app.canvas);
-      
-      // Force canvas to fill container immediately
-      const rect = containerRef.current!.getBoundingClientRect();
-      const actualWidth = rect.width || window.innerWidth;
-      const actualHeight = rect.height || window.innerHeight;
-      
-      if (actualWidth !== containerWidth || actualHeight !== containerHeight) {
-        // Resizing canvas to actual container size
-        app.renderer.resize(actualWidth, actualHeight);
-      }
-      
-      // Ensure canvas fills the container
-      app.canvas.style.width = '100%';
-      app.canvas.style.height = '100%';
-      app.canvas.style.display = 'block';
-      appRef.current = app;
-      moduleApp = app; // Store at module level
-
-      // Add resize handler
-      const handleResize = () => {
-        if (appRef.current && containerRef.current) {
-          const rect = containerRef.current.getBoundingClientRect();
-          const newWidth = rect.width || window.innerWidth;
-          const newHeight = rect.height || window.innerHeight;
-          debugLogger.log('PIXI', 'Resizing canvas', { 
-            newWidth, 
-            newHeight,
-            containerClient: { width: containerRef.current.clientWidth, height: containerRef.current.clientHeight },
-            boundingRect: { width: rect.width, height: rect.height }
-          });
-          appRef.current.renderer.resize(newWidth, newHeight);
-          
-          // Ensure canvas fills container after resize
-          appRef.current.canvas.style.width = '100%';
-          appRef.current.canvas.style.height = '100%';
+        autoStart: false,
+      }),
+      activate: () => {
+        container.appendChild(app.canvas);
+        app.canvas.style.width = '100%';
+        app.canvas.style.height = '100%';
+        app.canvas.style.display = 'block';
+        appRef.current = app;
+        const trackContainer = new PIXI.Container();
+        app.stage.addChild(trackContainer);
+        trackContainerRef.current = trackContainer;
+        handleResize();
+        resizeObserver.observe(container);
+        window.addEventListener('resize', scheduleResize);
+        lastTimeRef.current = performance.now();
+        app.ticker.add(onTick);
+        setPixiReady(true);
+        app.ticker.start();
+      },
+      destroy: () => {
+        app.ticker.remove(onTick);
+        app.ticker.stop();
+        resizeObserver.disconnect();
+        window.removeEventListener('resize', scheduleResize);
+        if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+        app.destroy(true, { children: true });
+        // A cancelled initialization must not clear a newer session's scene.
+        if (appRef.current === app) {
+          appRef.current = null;
+          trackContainerRef.current = null;
+          tilesContainerRef.current = null;
+          tireMarksContainerRef.current = null;
+          carsRef.current.clear();
+          renderedTilesRef.current.clear();
+          prevCarPositionsRef.current.clear();
+          cameraRef.current = { x: 0, y: 0 };
         }
-      };
-      
-      window.addEventListener('resize', handleResize);
-      
-      // Store cleanup function
-      const cleanup = () => {
-        window.removeEventListener('resize', handleResize);
-      };
-
-      // Create track container
-      const trackContainer = new PIXI.Container();
-      
-      // Ensure no clipping masks or bounds restrictions
-      trackContainer.mask = null;
-      trackContainer.cullable = false;
-      trackContainer.renderable = true;
-      trackContainer.visible = true;
-      
-      app.stage.addChild(trackContainer);
-      trackContainerRef.current = trackContainer;
-      moduleTrackContainer = trackContainer; // Store at module level
-      
-      // Track container created
-
-      // Add render loop but don't start yet
-      app.ticker.add(renderLoop);
-      
-      // Mark PIXI as ready - this will trigger track drawing
-      setPixiReady(true);
-      
-      // Force immediate canvas size refresh
-      setTimeout(() => {
-        if (appRef.current && containerRef.current && !isDestroyedRef.current) {
-          const rect = containerRef.current.getBoundingClientRect();
-          const fullWidth = rect.width || window.innerWidth;
-          const fullHeight = rect.height || window.innerHeight;
-          
-          debugLogger.log('PIXI', 'Force canvas resize on ready', {
-            boundingRect: { width: rect.width, height: rect.height },
-            window: { width: window.innerWidth, height: window.innerHeight },
-            using: { width: fullWidth, height: fullHeight }
-          });
-          
-          appRef.current.renderer.resize(fullWidth, fullHeight);
-          appRef.current.canvas.style.width = '100%';
-          appRef.current.canvas.style.height = '100%';
-        }
-      }, 50);
-      
-      // Start the ticker AFTER pixiReady is set (track will be drawn in next effect)
-      // Use setTimeout to ensure React state update completes first
-      setTimeout(() => {
-        if (appRef.current && !isDestroyedRef.current) {
-          appRef.current.ticker.start();
-        }
-      }, 100);
-    };
-
-    initApp();
-
-    // Handle resize
-    const handleResize = () => {
-      if (!appRef.current || !containerRef.current) return;
-      appRef.current.renderer.resize(
-        containerRef.current.clientWidth,
-        containerRef.current.clientHeight
-      );
-    };
-
-    window.addEventListener('resize', handleResize);
-
-    return () => {
-      // Set destroyed flag FIRST to stop render loop immediately
-      isDestroyedRef.current = true;
-      window.removeEventListener('resize', handleResize);
-      
-      if (appRef.current) {
-        // Remove the render callback
-        appRef.current.ticker.remove(renderLoop);
-        
-        // Delay actual destruction to allow React strict mode remount
-        cleanupTimeoutId = window.setTimeout(() => {
-          cleanupTimeoutId = null;
-          debugLogger.log('PIXI', 'Executing delayed cleanup');
-          if (moduleApp) {
-            moduleApp.ticker.stop();
-            moduleApp.destroy(true, { children: true });
-            moduleApp = null;
-            moduleTrackContainer = null;
-          }
-          moduleInitializing = false; // Only reset after actual cleanup
-        }, 100) as unknown as number;
-        
-        appRef.current = null;
-      }
-      trackContainerRef.current = null;
-      carsRef.current.clear();
-      isInitializingRef.current = false;
-      setPixiReady(false);
-    };
+      },
+      onError: error => {
+        console.error('Failed to initialize game renderer:', error);
+        useNetworkStore.setState({ error: 'Unable to initialize the game renderer. Please reload the page.' });
+      },
+    });
   }, [containerRef]);
-
-  // Watch for container size changes and reinitialize if needed
-  useEffect(() => {
-    if (!containerRef.current || !appRef.current) return;
-    
-    const checkSize = () => {
-      const rect = containerRef.current!.getBoundingClientRect();
-      const containerWidth = rect.width || window.innerWidth;
-      const containerHeight = rect.height || window.innerHeight;
-      const currentWidth = appRef.current!.renderer.width;
-      const currentHeight = appRef.current!.renderer.height;
-      
-      if ((currentHeight === 0 && containerHeight > 0) || 
-          Math.abs(currentWidth - containerWidth) > 10 || 
-          Math.abs(currentHeight - containerHeight) > 10) {
-        debugLogger.log('PIXI', 'Container size changed, resizing', { 
-          from: { width: currentWidth, height: currentHeight },
-          to: { width: containerWidth, height: containerHeight }
-        });
-        appRef.current!.renderer.resize(containerWidth, containerHeight);
-        appRef.current!.canvas.style.width = '100%';
-        appRef.current!.canvas.style.height = '100%';
-      }
-    };
-    
-    const interval = setInterval(checkSize, 100); // Check every 100ms
-    return () => clearInterval(interval);
-  }, []);
 
   // Create a single tile at specified grid coordinates
   const createTile = useCallback((track: Track, tileX: number, tileY: number): PIXI.Container => {
@@ -545,7 +363,7 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
   // Render loop
   const renderLoop = useCallback(() => {
     // Exit early if destroyed or not properly initialized
-    if (isDestroyedRef.current || !appRef.current || !trackContainerRef.current) return;
+    if (!appRef.current || !trackContainerRef.current || !tilesContainerRef.current) return;
 
     // Calculate delta time
     const currentTime = performance.now();
@@ -833,6 +651,10 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
     });
   }, [localPlayerId, interpolateCars, updateVisibleTiles, currentTrack]);
 
+  useEffect(() => {
+    renderLoopRef.current = renderLoop;
+  }, [renderLoop]);
+
   // Create car sprite
   const createCarSprite = (carData: CarState): PIXI.Container => {
     const container = new PIXI.Container();
@@ -982,35 +804,6 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
     
     // Track drawn
   }, [currentTrack, pixiReady]);
-
-  // Update cars from room state
-  useEffect(() => {
-    if (!room?.players) return;
-    
-    const { setCarState } = useGameStore.getState();
-    
-    room.players.forEach((player) => {
-      if (player.position) {
-        console.log('🚗 RENDER DEBUG: Setting car state for', player.nickname);
-        console.log('  Player position:', player.position);
-        console.log('  Player angle:', player.angle);
-        
-        setCarState(player.id, {
-          position: player.position,
-          displayPosition: player.position,
-          targetPosition: player.position,
-          rotation: player.angle || 0,
-          displayRotation: player.angle || 0,
-          targetRotation: player.angle || 0,
-          velocity: player.velocity || { x: 0, y: 0 },
-          angularVelocity: 0,
-          lap: player.lap,
-          checkpoint: player.checkpointIndex,
-          finished: player.finished,
-        });
-      }
-    });
-  }, [room?.players]);
 
   return null; // Render happens in PIXI
 }
