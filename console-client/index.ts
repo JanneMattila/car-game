@@ -16,11 +16,14 @@
  *   NICKNAME      - Bot nickname (default: ConsoleBot)
  *   LAP_COUNT     - Number of laps (default: 5)
  *   AUTO_DRIVE    - Enable auto-drive (default: true, set to "false" for manual)
+ *   ROOM_CODE     - Join an existing room and wait for its host instead of creating a solo race
+ *   DRIVE_PATTERN - straight | circle-left | circle-right | figure-eight (default: straight)
  *   LOG_LEVEL     - Logging verbosity: full | summary | minimal (default: summary)
  */
 
 import { io, Socket } from 'socket.io-client';
 import readline from 'readline';
+import { getDrivingInput, parseDrivePattern } from './driving.js';
 import {
   ClientMessage,
   ServerMessage,
@@ -43,6 +46,7 @@ import {
   vec2Lerp,
   lerpAngle,
   vec2Distance,
+  unwrapForTrack,
 } from '../shared/index.js';
 
 // ── Client-side prediction ──────────────────────────────────────────
@@ -96,11 +100,7 @@ function unwrapPosition(
   reference: { x: number; y: number }
 ): { x: number; y: number } {
   if (!trackBounds || !trackBounds.wrapAround) return pos;
-  const w = trackBounds.width;
-  const h = trackBounds.height;
-  const kx = Math.round((reference.x - pos.x) / w);
-  const ky = Math.round((reference.y - pos.y) / h);
-  return { x: pos.x + kx * w, y: pos.y + ky * h };
+  return unwrapForTrack(pos, reference, trackBounds.width, trackBounds.height);
 }
 
 // Server-matching constants for Verlet integration (mirrors clientPrediction.ts)
@@ -369,22 +369,6 @@ interface InterpolatedCar extends CarState {
   displayRotation: number;
 }
 
-function unwrapForTrack(
-  pos: { x: number; y: number },
-  ref: { x: number; y: number },
-  trackWidth: number,
-  trackHeight: number
-): { x: number; y: number } {
-  const wrapX = trackWidth;
-  const wrapY = trackHeight;
-  let { x, y } = pos;
-  if (x - ref.x > wrapX / 2) x -= wrapX;
-  else if (x - ref.x < -wrapX / 2) x += wrapX;
-  if (y - ref.y > wrapY / 2) y -= wrapY;
-  else if (y - ref.y < -wrapY / 2) y += wrapY;
-  return { x, y };
-}
-
 // ── Configuration ──────────────────────────────────────────────────
 const SERVER_URL = process.env['SERVER_URL'] || 'http://localhost:3000';
 const TRACK_ID = process.env['TRACK_ID'] || 'track-1769970584891'; // Forever track
@@ -394,6 +378,8 @@ const INPUT_TICK_MS = Math.round(1000 / GAME_CONSTANTS.PHYSICS_TICK_RATE);
 const PREDICTION_TICK_MS = Math.round(1000 / 60); // 60fps prediction frames
 const LOG_INTERVAL_MS = 500;
 const AUTO_DRIVE = process.env['AUTO_DRIVE'] !== 'false';
+const ROOM_CODE = process.env['ROOM_CODE']?.trim().toUpperCase();
+const DRIVE_PATTERN = parseDrivePattern(process.env['DRIVE_PATTERN']);
 const LOG_LEVEL = (process.env['LOG_LEVEL'] || 'summary') as 'full' | 'summary' | 'minimal';
 
 // ── ANSI colors ────────────────────────────────────────────────────
@@ -747,17 +733,10 @@ function initializeCars(carSnapshots: CarStateSnapshot[]): void {
 function getAutoDriveInput(): PlayerInput {
   sequenceNumber++;
   return {
+    ...getDrivingInput(DRIVE_PATTERN, Date.now() - raceStartTime),
     playerId: playerId!,
     sequence: sequenceNumber,
     timestamp: Date.now(),
-    accelerate: true,
-    brake: false,
-    steerLeft: false,
-    steerRight: false,
-    steerValue: 0,
-    nitro: false,
-    handbrake: false,
-    respawn: false,
   };
 }
 
@@ -818,7 +797,16 @@ function handleMessage(message: ServerMessage): void {
       serverTimeOffset = Date.now() - message.serverTime;
       logNet(`Welcome! playerId=${C.bright}${playerId}${C.reset}`, { serverTimeOffset });
       gamePhase = 'connected';
-      createRoom();
+      if (ROOM_CODE) {
+        sendMessage({
+          type: 'join_room',
+          code: ROOM_CODE,
+          nickname: NICKNAME,
+          preferredColor: 'blue',
+        });
+      } else {
+        createRoom();
+      }
       break;
 
     case 'room_joined':
@@ -832,10 +820,12 @@ function handleMessage(message: ServerMessage): void {
       });
       gamePhase = 'lobby';
       sendMessage({ type: 'set_ready', ready: true });
-      setTimeout(() => {
-        logGame('Starting game...');
-        sendMessage({ type: 'start_game' });
-      }, 500);
+      if (!ROOM_CODE) {
+        setTimeout(() => {
+          logGame('Starting game...');
+          sendMessage({ type: 'start_game' });
+        }, 500);
+      }
       break;
 
     case 'room_left':
@@ -1083,7 +1073,9 @@ let pingInterval: ReturnType<typeof setInterval> | null = null;
 let lastPredictionTime: number = 0;
 
 function startGameLoops(): void {
+  stopGameLoops();
   logGame(`Loops started: input=${INPUT_TICK_MS}ms prediction=${PREDICTION_TICK_MS}ms auto_drive=${AUTO_DRIVE}`);
+  if (AUTO_DRIVE) logGame(`Driving pattern: ${DRIVE_PATTERN}`);
 
   // Input loop at physics tick rate (60Hz)
   inputInterval = setInterval(sendInputAndPredict, INPUT_TICK_MS);

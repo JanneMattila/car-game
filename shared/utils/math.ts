@@ -68,6 +68,19 @@ export function vec2Clone(v: Vector2): Vector2 {
   return { x: v.x, y: v.y };
 }
 
+/** Find the track copy nearest a continuous (potentially many laps away) position. */
+export function unwrapForTrack(
+  position: Vector2,
+  reference: Vector2,
+  width: number,
+  height: number
+): Vector2 {
+  return {
+    x: position.x + Math.round((reference.x - position.x) / width) * width,
+    y: position.y + Math.round((reference.y - position.y) / height) * height,
+  };
+}
+
 export function vec2FromAngle(angle: number): Vector2 {
   return { x: Math.cos(angle), y: Math.sin(angle) };
 }

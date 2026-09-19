@@ -112,11 +112,48 @@ new countdown automatically.
   initialization cannot attach another canvas or restart an old loop.
 - The network game store owns car reconciliation. The renderer reads those
   positions rather than copying wrapped room coordinates over them.
+- Browser and console clients unwrap remote positions into the nearest track
+  copy, including after multiple positive or negative wraps.
+- The renderer keeps a remote-car sprite in every visible track copy, with
+  offscreen padding. Crossing half a track from the camera does not move a
+  visible sprite to the opposite side of the screen.
 - Server physics advances in fixed 60 Hz steps based on elapsed time, with
   catch-up capped at 100 ms per callback after a long stall.
 - When validating movement, hold **ArrowUp** across track boundaries and repeat
   after **Play Again** and leaving/rejoining. Normal driving should not trigger
   large backward jumps or `[SNAP]` corrections in the **B** debug overlay.
+
+### Two-player Console Testing
+
+Create a private room in the browser, choose the Forever wrap-around track,
+and increase the lap count to allow sustained testing. In a second PowerShell
+terminal, join it using the room code:
+
+```powershell
+$env:ROOM_CODE = 'ABC123'
+$env:NICKNAME = 'CircleBot'
+$env:DRIVE_PATTERN = 'figure-eight'
+$env:LOG_LEVEL = 'summary'
+npm run dev:console
+```
+
+The console player readies automatically; the browser host starts the race.
+Hold **ArrowUp** with **ArrowLeft** or **ArrowRight**, switch directions, then
+brake with **ArrowDown**. Watch both cars through several turns and wrap
+boundaries. Unexpected position jumps or reconciliation snaps indicate a
+movement regression.
+
+| Setting | Behavior |
+| --- | --- |
+| `ROOM_CODE` | Join an existing room. Omit to create and start a solo room. |
+| `DRIVE_PATTERN=straight` | Accelerate without steering (default). |
+| `DRIVE_PATTERN=circle-left` | Accelerate while steering left continuously. |
+| `DRIVE_PATTERN=circle-right` | Accelerate while steering right continuously. |
+| `DRIVE_PATTERN=figure-eight` | Alternate right and left steering every eight seconds. |
+
+Driving patterns apply when automatic driving is enabled (the default).
+Stop the console player with **Ctrl+C**. Run `npm test` for pattern and
+multi-wrap position regression tests.
 
 ## 📁 Project Structure
 

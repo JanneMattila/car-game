@@ -5,6 +5,7 @@ import { useGameStore } from '../store/gameStore';
 import { useNetworkStore } from '../store/networkStore';
 import { debugLogger } from '../utils/debugLogger';
 import { startRendererSession } from './rendererSession';
+import { getVisibleCarCopies } from './wrappedCarCopies';
 
 interface GameRendererProps {
   containerRef: React.RefObject<HTMLDivElement>;
@@ -15,7 +16,7 @@ interface GameRendererProps {
 function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) {
   const appRef = useRef<PIXI.Application | null>(null);
   const renderLoopRef = useRef<() => void>(() => {});
-  const carsRef = useRef<Map<string, PIXI.Container>>(new Map());
+  const carsRef = useRef<Map<string, Map<string, PIXI.Container>>>(new Map());
   const trackContainerRef = useRef<PIXI.Container | null>(null);
   const tireMarksContainerRef = useRef<PIXI.Container | null>(null);
   const cameraRef = useRef({ x: 0, y: 0 });
@@ -489,58 +490,52 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
 
     // Update car sprites
     currentCars.forEach((carData, id) => {
-      let carContainer = carsRef.current.get(id);
-      
-      if (!carContainer) {
-        carContainer = createCarSprite(carData);
-        trackContainerRef.current!.addChild(carContainer);
-        carsRef.current.set(id, carContainer);
+      let sprites = carsRef.current.get(id);
+      if (!sprites) {
+        sprites = new Map();
+        carsRef.current.set(id, sprites);
       }
-
-      // For wrap-around tracks, position cars relative to the continuous camera.
-      // Local player: displayPosition is already continuous (from prediction), no adjustment needed.
-      // Remote players: server sends wrapped positions [0, w)×[0, h), find the copy closest to camera.
-      let carX = carData.displayPosition.x;
-      let carY = carData.displayPosition.y;
-      
-      if (currentTrack?.wrapAround && id !== localPlayerId) {
-        // Remote cars: find the copy closest to camera using Math.round
-        const w = currentTrack.width;
-        const h = currentTrack.height;
-        const kx = Math.round((cameraRef.current.x - carX) / w);
-        const ky = Math.round((cameraRef.current.y - carY) / h);
-        carX += kx * w;
-        carY += ky * h;
-      }
-
-      // Update position and rotation
-      carContainer.x = carX;
-      carContainer.y = carY;
-      carContainer.rotation = carData.displayRotation;
-
-      // Update front wheel rotation based on steering
-      // For local player, use current input for immediate response
-      // For remote players, use the server-synced steering angle
       const { currentInput } = useGameStore.getState();
       const isLocalPlayer = id === localPlayerId;
       const steerAngle = isLocalPlayer ? (currentInput.steerValue || 0) : (carData.steeringAngle || 0);
-      
-      carContainer.children.forEach(child => {
-        if (child.label === 'frontWheel0' || child.label === 'frontWheel1') {
-          (child as PIXI.Container).rotation = steerAngle * 0.4; // Max ~23 degree visual turn
-        }
-      });
+      const copies = currentTrack?.wrapAround && !isLocalPlayer
+        ? getVisibleCarCopies(
+          carData.displayPosition,
+          cameraRef.current,
+          { width: screenWidth, height: screenHeight },
+          currentTrack
+        )
+        : [{ key: '0:0', ...carData.displayPosition }];
+      const visibleKeys = new Set(copies.map(copy => copy.key));
 
-      // Update visibility
-      carContainer.visible = true;
+      for (const copy of copies) {
+        let sprite = sprites.get(copy.key);
+        if (!sprite) {
+          sprite = createCarSprite(carData);
+          trackContainerRef.current!.addChild(sprite);
+          sprites.set(copy.key, sprite);
+        }
+        sprite.position.set(copy.x, copy.y);
+        sprite.rotation = carData.displayRotation;
+        sprite.children.forEach(child => {
+          if (child.label === 'frontWheel0' || child.label === 'frontWheel1') {
+            child.rotation = steerAngle * 0.4;
+          }
+        });
+      }
+      for (const [key, sprite] of sprites) {
+        if (!visibleKeys.has(key)) {
+          sprite.removeFromParent();
+          sprite.destroy({ children: true });
+          sprites.delete(key);
+        }
+      }
       
       // === TIRE MARKS ===
       if (tireMarksContainerRef.current) {
         const prevPos = prevCarPositionsRef.current.get(id);
-        // Use the adjusted continuous position for wrap-around tracks
         const currentPos = {
-          x: carX,
-          y: carY,
+          ...carData.displayPosition,
           rotation: carData.displayRotation,
         };
         
@@ -605,32 +600,31 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
               const sin = Math.sin(currentPos.rotation);
               
               wheelOffsets.forEach(offset => {
-                // FIFO: ensure capacity before adding new marks
-                while (tireMarkCountRef.current >= MAX_TIRE_MARKS && tireMarksContainerRef.current!.children.length > 0) {
-                  const oldest = tireMarksContainerRef.current!.children[0];
-                  tireMarksContainerRef.current!.removeChild(oldest);
-                  oldest.destroy();
-                  tireMarkCountRef.current--;
-                }
-
                 const worldX = currentPos.x + offset.x * cos - offset.y * sin;
                 const worldY = currentPos.y + offset.x * sin + offset.y * cos;
                 
                 const prevWorldX = prevPos.x + offset.x * Math.cos(prevPos.rotation) - offset.y * Math.sin(prevPos.rotation);
                 const prevWorldY = prevPos.y + offset.x * Math.sin(prevPos.rotation) + offset.y * Math.cos(prevPos.rotation);
                 
-                // Draw tire mark
-                const mark = new PIXI.Graphics();
-                mark.moveTo(prevWorldX, prevWorldY);
-                mark.lineTo(worldX, worldY);
-                
                 // Darker and thicker marks for harder skids
                 const alpha = 0.2 + skidIntensity * 0.5;
                 const width = 2 + skidIntensity * 4;
-                mark.stroke({ color: 0x1a1a1a, width, alpha });
-                
-                tireMarksContainerRef.current!.addChild(mark);
-                tireMarkCountRef.current++;
+                for (const copy of copies) {
+                  while (tireMarkCountRef.current >= MAX_TIRE_MARKS && tireMarksContainerRef.current!.children.length > 0) {
+                    const oldest = tireMarksContainerRef.current!.children[0]!;
+                    tireMarksContainerRef.current!.removeChild(oldest);
+                    oldest.destroy();
+                    tireMarkCountRef.current--;
+                  }
+                  const offsetX = copy.x - currentPos.x;
+                  const offsetY = copy.y - currentPos.y;
+                  const mark = new PIXI.Graphics();
+                  mark.moveTo(prevWorldX + offsetX, prevWorldY + offsetY);
+                  mark.lineTo(worldX + offsetX, worldY + offsetY);
+                  mark.stroke({ color: 0x1a1a1a, width, alpha });
+                  tireMarksContainerRef.current!.addChild(mark);
+                  tireMarkCountRef.current++;
+                }
               });
             }
           }
@@ -642,11 +636,14 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
     });
 
     // Remove cars that are no longer in the game
-    carsRef.current.forEach((container, id) => {
+    carsRef.current.forEach((sprites, id) => {
       if (!currentCars.has(id)) {
-        trackContainerRef.current!.removeChild(container);
-        container.destroy();
+        for (const sprite of sprites.values()) {
+          sprite.removeFromParent();
+          sprite.destroy({ children: true });
+        }
         carsRef.current.delete(id);
+        prevCarPositionsRef.current.delete(id);
       }
     });
   }, [localPlayerId, interpolateCars, updateVisibleTiles, currentTrack]);
@@ -763,7 +760,7 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
     if (!pixiReady || !trackContainerRef.current || !currentTrack) return;
 
     // Clear existing track elements (except cars)
-    const carContainers = Array.from(carsRef.current.values());
+    const carContainers = Array.from(carsRef.current.values()).flatMap(sprites => [...sprites.values()]);
     trackContainerRef.current.removeChildren();
     
     // Reset camera offset for new track

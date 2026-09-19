@@ -9,28 +9,8 @@ import {
   PHYSICS_CONSTANTS,
 } from '@shared';
 import { useNetworkStore } from './networkStore';
-import { vec2Lerp, lerpAngle, vec2Distance } from '@shared';
+import { vec2Lerp, lerpAngle, vec2Distance, unwrapForTrack } from '@shared';
 import { reconcileWithServer, initializePrediction, clearPrediction, predictFrame } from '../game/clientPrediction';
-
-/**
- * Unwrap a position into the same coordinate space as a reference position.
- * Prevents false teleport-snaps and bad interpolation when positions straddle a wrap boundary.
- */
-function unwrapForTrack(
-  pos: { x: number; y: number },
-  ref: { x: number; y: number },
-  trackWidth: number,
-  trackHeight: number
-): { x: number; y: number } {
-  const wrapX = trackWidth;
-  const wrapY = trackHeight;
-  let { x, y } = pos;
-  if (x - ref.x > wrapX / 2) x -= wrapX;
-  else if (x - ref.x < -wrapX / 2) x += wrapX;
-  if (y - ref.y > wrapY / 2) y -= wrapY;
-  else if (y - ref.y < -wrapY / 2) y += wrapY;
-  return { x, y };
-}
 
 interface InterpolatedCar extends CarState {
   targetPosition: { x: number; y: number };

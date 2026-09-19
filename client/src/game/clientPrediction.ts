@@ -1,7 +1,7 @@
 // Client-side prediction with server reconciliation
 // Provides smooth movement by predicting locally and correcting when server responds
 
-import { PHYSICS_CONSTANTS } from '@shared';
+import { PHYSICS_CONSTANTS, unwrapForTrack } from '@shared';
 
 interface PredictedState {
   x: number;
@@ -91,25 +91,9 @@ export function setTrackBounds(bounds: TrackBounds | null): void {
 // around the camera, so the car always sees a seamless track.
 // Only the SERVER wraps positions (for physics collision checks).
 
-/**
- * Adjust a position to be in the same "wrap space" as a reference position
- * This prevents jumps during reconciliation when positions are on opposite sides of a wrap boundary
- */
-/**
- * Find the copy of `pos` closest to `reference` in wrap space.
- * Uses Math.round to handle positions that have accumulated many wrap cycles
- * (e.g., continuous prediction at y=-3000 vs server-wrapped y=580).
- */
 function unwrapPosition(pos: { x: number; y: number }, reference: { x: number; y: number }): { x: number; y: number } {
   if (!trackBounds || !trackBounds.wrapAround) return pos;
-  
-  const w = trackBounds.width;
-  const h = trackBounds.height;
-  
-  const kx = Math.round((reference.x - pos.x) / w);
-  const ky = Math.round((reference.y - pos.y) / h);
-  
-  return { x: pos.x + kx * w, y: pos.y + ky * h };
+  return unwrapForTrack(pos, reference, trackBounds.width, trackBounds.height);
 }
 
 /**
