@@ -274,7 +274,7 @@ export class GameRoom {
 
   // Game flow
   canStart(): boolean {
-    if (this.state !== 'waiting') return false;
+    if (this.state !== 'waiting' && this.state !== 'results') return false;
     if (this.players.size < GAME_CONSTANTS.MIN_PLAYERS_TO_START) return false;
     
     const readyCount = Array.from(this.players.values()).filter(p => p.isReady).length;
@@ -284,6 +284,7 @@ export class GameRoom {
   startGame(): boolean {
     if (!this.canStart()) return false;
 
+    this.resetRaceState();
     this.state = 'countdown';
     this.gameState.phase = 'countdown';
     this.gameState.countdown = GAME_CONSTANTS.COUNTDOWN_SECONDS;
@@ -655,6 +656,13 @@ export class GameRoom {
 
   // Cleanup
   resetToLobby(): void {
+    this.resetRaceState();
+    for (const player of this.players.values()) {
+      player.isReady = false;
+    }
+  }
+
+  private resetRaceState(): void {
     this.state = 'waiting';
     this.gameState = {
       phase: 'waiting',
@@ -666,12 +674,10 @@ export class GameRoom {
 
     this.cars.clear();
     this.results = [];
+    this.pendingEvents = [];
+    this.startedAt = 0;
+    this.lastActivity = Date.now();
     this.physics.reset();
-
-    // Reset player ready states
-    for (const player of this.players.values()) {
-      player.isReady = false;
-    }
   }
 
   shutdown(): void {

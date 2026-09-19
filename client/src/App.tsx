@@ -16,6 +16,8 @@ function App() {
   const connectRef = useRef(useNetworkStore.getState().connect);
   const loadSettingsRef = useRef(useSettingsStore.getState().loadFromStorage);
   const room = useNetworkStore(state => state.room);
+  const error = useNetworkStore(state => state.error);
+  const clearError = useNetworkStore(state => state.clearError);
 
   useEffect(() => {
     // Load settings from local storage
@@ -32,6 +34,14 @@ function App() {
 
   return (
     <div className="app">
+      {error && (
+        <div className="network-error" role="alert">
+          <span>{error}</span>
+          <button className="btn btn-ghost btn-small" onClick={clearError}>
+            Dismiss
+          </button>
+        </div>
+      )}
       <Routes>
         <Route path="/" element={<MainMenu />} />
         <Route path="/lobby" element={<Lobby />} />

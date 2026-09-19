@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useNetworkStore } from '../store/networkStore';
 import { useSettingsStore } from '../store/settingsStore';
-import { CAR_COLORS } from '@shared';
+import { validateNickname } from '@shared';
 import './Lobby.css';
 
 function Lobby() {
@@ -19,6 +19,8 @@ function Lobby() {
     createRoom,
   } = useNetworkStore();
   const { nickname, preferredColor } = useSettingsStore();
+  const nicknameValidation = validateNickname(nickname);
+  const canJoin = connected && nicknameValidation.valid;
 
   useEffect(() => {
     if (connected) {
@@ -51,7 +53,7 @@ function Lobby() {
     joinRoom(roomId, nickname, preferredColor);
   };
 
-  const handleCreateRoom = (trackId: string, isPrivate: boolean) => {
+  const handleCreateRoom = (trackId: string | undefined, isPrivate: boolean) => {
     createRoom({ trackId, isPrivate }, nickname, preferredColor);
   };
 
@@ -68,13 +70,23 @@ function Lobby() {
         <h1>Game Lobby</h1>
         <button 
           className="btn btn-primary"
-          onClick={() => handleCreateRoom('default-oval', false)}
+          onClick={() => handleCreateRoom(undefined, false)}
+          disabled={!canJoin || trackList.length === 0}
         >
           + Create Room
         </button>
       </header>
 
       <div className="screen-content">
+        {!connected && <p role="status">Connecting to the server...</p>}
+        {!nicknameValidation.valid && (
+          <div role="alert">
+            <p>{nicknameValidation.error}</p>
+            <button className="btn btn-secondary" onClick={() => navigate('/')}>
+              Edit nickname
+            </button>
+          </div>
+        )}
         <section className="room-list-section">
           <h2>Available Rooms ({roomList.length})</h2>
           
@@ -106,7 +118,7 @@ function Lobby() {
                   <button
                     className="btn btn-primary"
                     onClick={() => handleJoinRoom(roomItem.id)}
-                    disabled={roomItem.playerCount >= roomItem.maxPlayers}
+                    disabled={!canJoin || roomItem.playerCount >= roomItem.maxPlayers}
                   >
                     {roomItem.playerCount >= roomItem.maxPlayers ? 'Full' : 'Join'}
                   </button>
@@ -135,12 +147,14 @@ function Lobby() {
                   <button
                     className="btn btn-primary btn-small"
                     onClick={() => handleCreateRoom(track.id, false)}
+                    disabled={!canJoin}
                   >
                     Public
                   </button>
                   <button
                     className="btn btn-secondary btn-small"
                     onClick={() => handleCreateRoom(track.id, true)}
+                    disabled={!canJoin}
                   >
                     Private
                   </button>

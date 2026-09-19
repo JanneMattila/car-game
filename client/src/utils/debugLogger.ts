@@ -1,5 +1,5 @@
 const API_URL = (import.meta as unknown as { env: Record<string, string> }).env.VITE_API_URL || 
-  (typeof window !== 'undefined' && window.location.hostname !== 'localhost' ? '/api' : 'http://localhost:3000/api');
+  '/api';
 
 interface LogEntry {
   category: string;

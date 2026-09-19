@@ -23,7 +23,7 @@
 
 - Build production artifacts with `npm run localbuild`, or use `npm run build:server` / `npm run build:client` for scoped changes. `npm run build` is intentionally a no-op, not a validation command.
 - Run `npm run lint` for code changes. Bundling does not type-check; use `npx tsc --noEmit -p tsconfig.json` and `npx tsc --noEmit -p client\tsconfig.json` for the affected code.
-- There is no configured `npm test` script. Validate affected gameplay in the browser, using multiple clients for multiplayer changes. [test-client.mjs](../test-client.mjs) is a specialized wrap-around diagnostic that requires a running server and its configured track, not a general test suite.
+- Run `npm test` for race lifecycle regression tests. Also validate affected gameplay in the browser, using multiple clients for multiplayer changes. [test-client.mjs](../test-client.mjs) is a specialized wrap-around diagnostic that requires a running server and its configured track, not a general test suite.
 - For UI changes, verify the affected screen in the browser. Documentation-only changes do not require starting the app or running builds.
 - Build output in `dist` is generated; edit source files instead.
 

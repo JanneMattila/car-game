@@ -54,7 +54,8 @@ function WaitingRoom() {
   const isHost = localPlayer?.isHost;
   const track = trackList.find(t => t.id === room.trackId);
   const allReady = room.players.every(p => p.ready);
-  const canStart = allReady && room.players.length >= 1;
+  const canStart = (room.state === 'waiting' || room.state === 'results')
+    && allReady && room.players.length >= 1;
 
   const handleLeave = () => {
     leaveRoom();

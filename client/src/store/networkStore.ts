@@ -22,6 +22,7 @@ import {
 interface NetworkState {
   socket: Socket | null;
   connected: boolean;
+  error: string | null;
   playerId: string | null;
   localPlayerId: string | null; // Alias for playerId
   latency: number;
@@ -43,6 +44,7 @@ interface NetworkState {
   // Actions
   connect: () => void;
   disconnect: () => void;
+  clearError: () => void;
   send: (message: ClientMessage) => void;
   
   // Room actions
@@ -69,6 +71,7 @@ interface NetworkState {
 export const useNetworkStore = create<NetworkState>((set, get) => ({
   socket: null,
   connected: false,
+  error: null,
   playerId: null,
   localPlayerId: null,
   latency: 0,
@@ -86,14 +89,9 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 
   connect: () => {
     const existingSocket = get().socket;
-    if (existingSocket?.connected) return;
+    if (existingSocket) return;
 
-    // Use relative URL in production, explicit localhost in development
-    const serverUrl = typeof window !== 'undefined' && window.location.hostname === 'localhost'
-      ? 'http://localhost:3000'
-      : window.location.origin;
-
-    const socket = io(serverUrl, {
+    const socket = io({
       transports: ['websocket'],
       reconnection: true,
       reconnectionAttempts: 5,
@@ -101,8 +99,13 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     });
 
     socket.on('connect', () => {
-      set({ connected: true });
+      set({ connected: true, error: null });
       debugLogger.log('SOCKET', 'Connected to server');
+    });
+
+    socket.on('connect_error', (error: Error) => {
+      set({ connected: false, error: 'Unable to connect to the server. Please try again.' });
+      debugLogger.log('ERROR', 'Connection failed', { message: error.message });
     });
 
     socket.on('disconnect', () => {
@@ -132,10 +135,15 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     const { socket, connected } = get();
     if (socket && connected) {
       socket.emit('message', message);
+    } else if (message.type === 'create_room' || message.type === 'join_room') {
+      set({ error: 'Not connected to the server. Please wait for the connection and try again.' });
     }
   },
 
+  clearError: () => set({ error: null }),
+
   createRoom: (settings, nickname, color) => {
+    set({ error: null });
     get().send({
       type: 'create_room',
       settings: settings as GameSettings,
@@ -145,6 +153,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   },
 
   joinRoom: (roomIdOrCode, nickname, color) => {
+    set({ error: null });
     const isCode = roomIdOrCode.length === 6;
     get().send({
       type: 'join_room',
@@ -166,6 +175,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   },
 
   startGame: () => {
+    set({ error: null });
     get().send({ type: 'start_game' });
   },
 
@@ -221,6 +231,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 
       case 'room_joined':
         set({ 
+          error: null,
           room: message.room, 
           players: message.players,
         });
@@ -273,8 +284,26 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
           carsCount: message.cars?.length,
           countdown: message.countdown
         });
+        useGameStore.getState().reset();
         set(state => state.room ? {
-          room: { ...state.room, state: 'countdown' },
+          room: {
+            ...state.room,
+            state: 'countdown',
+            players: state.room.players.map(player => ({
+              ...player,
+              position: null,
+              angle: 0,
+              velocity: null,
+              lap: 0,
+              checkpointIndex: 0,
+              finished: false,
+              finishTime: null,
+              bestLapTime: null,
+            })),
+          },
+          error: null,
+          gameState: null,
+          results: [],
           track: message.track || state.track,
         } : {});
         // Set track bounds for client prediction wrap-around
@@ -444,7 +473,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 
       case 'error':
         debugLogger.log('ERROR', 'Server error', { code: message.code, message: message.message });
-        // Could dispatch to a toast/notification system
+        set({ error: message.message });
         break;
     }
   },

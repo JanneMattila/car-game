@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useSettingsStore } from '../store/settingsStore';
 import { useNetworkStore } from '../store/networkStore';
-import { CarColor, COLOR_ORDER, CAR_COLORS } from '@shared';
+import { COLOR_ORDER, CAR_COLORS, validateNickname } from '@shared';
 import './MainMenu.css';
 
 function MainMenu() {
@@ -12,7 +12,7 @@ function MainMenu() {
   const { connected, createRoom, joinRoom, room, trackList, requestTrackList } = useNetworkStore();
   const [joinCode, setJoinCode] = useState('');
   const [error, setError] = useState('');
-  const [showSettings, setShowSettings] = useState(!nickname);
+  const [showSettings, setShowSettings] = useState(!validateNickname(nickname).valid);
 
   // Navigate as soon as a room is joined (quick play or manual join)
   useEffect(() => {
@@ -31,21 +31,24 @@ function MainMenu() {
     }
   }, [connected, requestTrackList]);
 
-  const handlePlay = () => {
-    if (!nickname.trim()) {
-      setError('Please enter a nickname');
+  const checkNickname = () => {
+    const validation = validateNickname(nickname);
+    if (!validation.valid) {
+      setError(validation.error!);
       setShowSettings(true);
-      return;
+      return false;
     }
+    setError('');
+    return true;
+  };
+
+  const handlePlay = () => {
+    if (!checkNickname()) return;
     navigate('/lobby');
   };
 
   const handleQuickPlay = () => {
-    if (!nickname.trim()) {
-      setError('Please enter a nickname');
-      setShowSettings(true);
-      return;
-    }
+    if (!checkNickname()) return;
     if (!trackList.length) {
       setError('No tracks available for quick play.');
       alert('No tracks available for quick play. Please add a track first.');
@@ -61,11 +64,7 @@ function MainMenu() {
   };
 
   const handleJoinByCode = () => {
-    if (!nickname.trim()) {
-      setError('Please enter a nickname');
-      setShowSettings(true);
-      return;
-    }
+    if (!checkNickname()) return;
     if (!joinCode.trim() || joinCode.length !== 6) {
       setError('Please enter a valid 6-character room code');
       return;
@@ -92,8 +91,9 @@ function MainMenu() {
               <h2>Player Settings</h2>
               
               <div className="form-group">
-                <label>Nickname</label>
+                <label htmlFor="nickname">Nickname</label>
                 <input
+                  id="nickname"
                   type="text"
                   className="input"
                   placeholder="Enter nickname"
@@ -121,15 +121,13 @@ function MainMenu() {
                 </div>
               </div>
 
-              {error && <p className="error-text">{error}</p>}
+              {error && <p className="error-text" role="alert">{error}</p>}
 
               <button
                 className="btn btn-primary"
                 onClick={() => {
-                  if (nickname.trim()) {
+                  if (checkNickname()) {
                     setShowSettings(false);
-                  } else {
-                    setError('Please enter a nickname');
                   }
                 }}
               >

@@ -85,6 +85,19 @@ npm run dev:client
 - **API Server**: http://localhost:3000
 - **Socket.IO**: ws://localhost:3000 (WebSocket connection)
 
+If port 5173 is occupied, use the client URL printed by Vite (for example,
+http://localhost:5174). The browser uses same-origin `/api` and `/socket.io`
+requests, which Vite proxies to the backend on port 3000.
+
+Before creating or joining a room, choose a nickname with 2-16 characters
+(letters, numbers, underscores, or hyphens). Invalid nicknames are shown in
+the player settings or lobby; server errors appear in a dismissible banner.
+
+After a race, choose **Play Again** to return to the same room. Ready states
+are preserved, and the host can start the next race. Each race resets cars,
+lap times, race timing, and results. Players still viewing results join the
+new countdown automatically.
+
 ### 5. Development Workflow
 
 - Client auto-reloads on file changes (Vite HMR)
@@ -148,6 +161,7 @@ car-game/
 - `npm start` - Start the production server (requires build first)
 
 ### Code Quality
+- `npm test` - Run race lifecycle regression tests
 - `npm run lint` - Run ESLint on all TypeScript files
 - `npm run lint:fix` - Fix ESLint issues automatically
 - `npm run format` - Format code with Prettier

@@ -21,6 +21,12 @@ function Results() {
   const { nickname } = useSettingsStore();
   const [showFullResults, setShowFullResults] = useState(false);
 
+  useEffect(() => {
+    if (room?.state === 'countdown' || room?.state === 'racing') {
+      navigate(`/room/${room.id}/game`);
+    }
+  }, [room?.state, room?.id, navigate]);
+
   // Redirect if no room
   useEffect(() => {
     if (!room) {

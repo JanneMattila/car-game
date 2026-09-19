@@ -14,6 +14,7 @@
     "build:server": "esbuild server/index.ts --bundle --platform=node --format=esm --outfile=dist/server/index.js --external:express --external:socket.io --external:cors --external:compression --external:dotenv --external:matter-js",
     "build:client": "vite build --config client/vite.config.ts",
     "start": "node dist/server/index.js",
+    "test": "node --import tsx --test tests/*.test.ts",
     "lint": "eslint . --ext .ts,.tsx",
     "lint:fix": "eslint . --ext .ts,.tsx --fix",
     "format": "prettier --write \"**/*.{ts,tsx,json,css,html}\""
