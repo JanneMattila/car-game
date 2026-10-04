@@ -10,16 +10,16 @@ function isRacing(): boolean {
   return room?.state === 'racing';
 }
 
-// Keyboard state
-const keyState: Record<string, boolean> = {};
 let inputSequence = 0;
 
 export function useKeyboardInput() {
   const { sendInput } = useNetworkStore();
   const { setInput } = useGameStore();
   const updateInputRef = useRef<() => void>();
+  const keys = useRef<Record<string, boolean>>({});
 
   const updateInput = useCallback(() => {
+    const keyState = keys.current;
     const steerLeft = keyState['KeyA'] || keyState['ArrowLeft'] || false;
     const steerRight = keyState['KeyD'] || keyState['ArrowRight'] || false;
     
@@ -83,26 +83,39 @@ export function useKeyboardInput() {
       if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
       
       const code = e.code;
-      if (!keyState[code]) {
-        keyState[code] = true;
+      if (!keys.current[code]) {
+        keys.current[code] = true;
         updateInput();
       }
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
       const code = e.code;
-      if (keyState[code]) {
-        keyState[code] = false;
+      if (keys.current[code]) {
+        keys.current[code] = false;
         updateInput();
       }
     };
 
+    const releaseKeys = () => {
+      keys.current = {};
+      updateInput();
+    };
+    const handleVisibilityChange = () => {
+      if (document.hidden) releaseKeys();
+    };
+
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', releaseKeys);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', releaseKeys);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      releaseKeys();
     };
   }, [updateInput]);
 

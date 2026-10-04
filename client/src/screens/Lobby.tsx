@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { useNetworkStore } from '../store/networkStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { validateNickname } from '@shared';
@@ -7,10 +7,8 @@ import './Lobby.css';
 
 function Lobby() {
   const navigate = useNavigate();
-  const location = useLocation();
   const { 
     connected, 
-    room, 
     roomList, 
     trackList,
     requestRoomList, 
@@ -28,16 +26,6 @@ function Lobby() {
       requestTrackList();
     }
   }, [connected, requestRoomList, requestTrackList]);
-
-  // Navigate to room when joined
-  useEffect(() => {
-    if (room) {
-      const target = `/room/${room.id}`;
-      if (location.pathname !== target) {
-        navigate(target);
-      }
-    }
-  }, [room, navigate, location.pathname]);
 
   // Refresh room list periodically
   useEffect(() => {

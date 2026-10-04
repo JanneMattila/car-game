@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { useNavigate, useParams, useLocation } from 'react-router-dom';
+import { useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useNetworkStore } from '../store/networkStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { CAR_COLORS, CarColor } from '@shared';
@@ -15,28 +15,12 @@ function formatTime(ms: number): string {
 
 function Results() {
   const navigate = useNavigate();
-  const location = useLocation();
   const { roomId } = useParams();
   const { room, localPlayerId, leaveRoom } = useNetworkStore();
   const { nickname } = useSettingsStore();
   const [showFullResults, setShowFullResults] = useState(false);
 
-  useEffect(() => {
-    if (room?.state === 'countdown' || room?.state === 'racing') {
-      navigate(`/room/${room.id}/game`);
-    }
-  }, [room?.state, room?.id, navigate]);
-
-  // Redirect if no room
-  useEffect(() => {
-    if (!room) {
-      if (location.pathname !== '/lobby') {
-        navigate('/lobby');
-      }
-    }
-  }, [room, navigate, location.pathname]);
-
-  if (!room) {
+  if (!room || room.id !== roomId) {
     return null;
   }
 
@@ -54,17 +38,12 @@ function Results() {
   const winner = sortedPlayers[0];
 
   const handlePlayAgain = () => {
-    const target = `/room/${room.id}`;
-    if (location.pathname !== target) {
-      navigate(target);
-    }
+    navigate(`/room/${room.id}`, { replace: true });
   };
 
   const handleLeave = () => {
     leaveRoom();
-    if (location.pathname !== '/lobby') {
-      navigate('/lobby');
-    }
+    navigate('/lobby', { replace: true });
   };
 
   return (

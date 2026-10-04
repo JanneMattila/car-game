@@ -17,3 +17,12 @@ export * from './constants/colors';
 // Utilities
 export * from './utils/math';
 export * from './utils/validation';
+export * from './utils/roadGeometry';
+export * from './utils/wallPhysics';
+export * from './utils/drivingResistance';
+export * from './utils/nitro';
+export * from './utils/raceGates';
+export * from './utils/finishMarkings';
+export * from './utils/sceneryGeometry';
+export * from './utils/circuitBuilder';
+export * from './tracks/circuitTemplates';

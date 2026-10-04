@@ -102,13 +102,14 @@ export class TrackManager {
         {
           id: generateUUID(),
           type: 'finish',
-          x: 180,
+          x: 97,
           y: 420,
-          position: { x: 180, y: 420 },
-          width: 120,
+          position: { x: 97, y: 420 },
+          width: 286,
           height: 20,
           rotation: 0,
-          layer: 0
+          layer: 0,
+          properties: { finishVisibleWidth: 120, finishVisibleOffset: 0 },
         }
       ],
       scenery: [],

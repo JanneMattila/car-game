@@ -1,8 +1,9 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { RoomInfo, CAR_COLORS, CarColor, PHYSICS_CONSTANTS, Track } from '@shared';
 import { useGameStore } from '../store/gameStore';
 import { useNetworkStore } from '../store/networkStore';
 import './GameHUD.css';
+import { MinimapTrackCache } from '../utils/minimapTrackCache';
 
 interface GameHUDProps {
   room: RoomInfo;
@@ -12,7 +13,7 @@ interface GameHUDProps {
 }
 
 function GameHUD({ room, localPlayerId, raceTimer, showMinimap }: GameHUDProps) {
-  const { cars } = useGameStore();
+  const cars = useGameStore(state => state.cars);
   const currentTrack = useNetworkStore(state => state.track);
   const minimapCanvasRef = useRef<HTMLCanvasElement>(null);
   
@@ -125,7 +126,9 @@ function GameHUD({ room, localPlayerId, raceTimer, showMinimap }: GameHUDProps) 
         {/* Nitro Gauge */}
         {localCar && (
           <div className="nitro-gauge">
-            <span className="nitro-label">NITRO</span>
+            <span className="nitro-label">
+              {localCar.nitroAmount <= 0 ? 'EMPTY - release SPACE to recharge' : 'NITRO'}
+            </span>
             <div className="nitro-bar-container">
               <div 
                 className="nitro-bar-fill"
@@ -175,11 +178,12 @@ function GameHUD({ room, localPlayerId, raceTimer, showMinimap }: GameHUDProps) 
 // Separate minimap component to handle canvas drawing
 function MinimapCanvas({ track, cars, players, localPlayerId }: {
   track: Track;
-  cars: Map<string, any>;
-  players: any[];
+  cars: ReturnType<typeof useGameStore.getState>['cars'];
+  players: RoomInfo['players'];
   localPlayerId: string | null;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const trackCache = useMemo(() => new MinimapTrackCache(), []);
   
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -208,16 +212,6 @@ function MinimapCanvas({ track, cars, players, localPlayerId }: {
     const centerOffsetX = minimapRadius;
     const centerOffsetY = minimapRadius;
     
-    // Helper to convert world coords to minimap coords (centered on local player)
-    const worldToMinimap = (worldX: number, worldY: number) => {
-      const relX = worldX - localPos.x;
-      const relY = worldY - localPos.y;
-      return {
-        x: centerOffsetX + relX * scale,
-        y: centerOffsetY + relY * scale
-      };
-    };
-    
     const tileOffsets = [{ x: 0, y: 0 }];
     if (track.wrapAround) {
       tileOffsets.length = 0;
@@ -232,37 +226,12 @@ function MinimapCanvas({ track, cars, players, localPlayerId }: {
       }
     }
     
-    // Draw track elements for each tile
-    if (track.elements && track.elements.length > 0) {
+    for (const layer of trackCache.get(track, scale)) {
       tileOffsets.forEach(offset => {
-        track.elements!.forEach(element => {
-          const worldX = (element.x ?? element.position?.x ?? 0) + offset.x;
-          const worldY = (element.y ?? element.position?.y ?? 0) + offset.y;
-          const pos = worldToMinimap(worldX, worldY);
-          const width = (element.width || 100) * scale;
-          const height = (element.height || 100) * scale;
-          
-          // Only draw if visible on minimap (with margin)
-          if (pos.x + width < -50 || pos.x > minimapSize + 50 ||
-              pos.y + height < -50 || pos.y > minimapSize + 50) {
-            return;
-          }
-          
-          switch (element.type) {
-            case 'road':
-              ctx.fillStyle = '#666699';
-              ctx.fillRect(pos.x, pos.y, width, height);
-              break;
-            case 'wall':
-              ctx.fillStyle = '#ff4444';
-              ctx.fillRect(pos.x, pos.y, width, height);
-              break;
-            case 'finish':
-              ctx.fillStyle = '#ffffff';
-              ctx.fillRect(pos.x, pos.y, width, height);
-              break;
-          }
-        });
+        ctx.drawImage(layer.canvas,
+          centerOffsetX + (layer.x + offset.x - localPos.x) * scale,
+          centerOffsetY + (layer.y + offset.y - localPos.y) * scale,
+          layer.width, layer.height);
       });
     }
 
@@ -379,7 +348,7 @@ function MinimapCanvas({ track, cars, players, localPlayerId }: {
     ctx.lineTo(centerOffsetX, centerOffsetY + 8);
     ctx.stroke();
     
-  }, [track, cars, players, localPlayerId]);
+  }, [track, cars, players, localPlayerId, trackCache]);
   
   return <canvas ref={canvasRef} width={150} height={150} />;
 }

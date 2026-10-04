@@ -10,7 +10,7 @@ function createRoom(t: TestContext, finishAutomatically = true, keepCheckpoint =
   const leaderboard = new LeaderboardManager(new StorageService('unused-test-storage'));
   t.mock.method(leaderboard, 'submitLapTime', async () => ({ rank: 1, isNewRecord: true }));
   t.mock.method(leaderboard, 'submitRaceTime', async () => ({ rank: 1, isNewRecord: true }));
-  // Overlapping race markers let real physics finish a one-lap race without driving.
+  // A short straight lets real physics finish by crossing the gates in order.
   const track: Track = {
     id: 'rematch-test',
     version: 1,
@@ -39,20 +39,20 @@ function createRoom(t: TestContext, finishAutomatically = true, keepCheckpoint =
         type: 'checkpoint',
         checkpointIndex: 0,
         x: 50,
-        y: 50,
-        position: { x: 50, y: 50 },
+        y: 90,
+        position: { x: 50, y: 90 },
         width: 200,
-        height: 200,
+        height: 20,
         rotation: 0,
       },
       {
         id: 'finish',
         type: 'finish',
         x: 50,
-        y: 50,
-        position: { x: 50, y: 50 },
+        y: 60,
+        position: { x: 50, y: 60 },
         width: 200,
-        height: 200,
+        height: 20,
         rotation: 0,
       },
     ],
@@ -80,7 +80,12 @@ function finishRace(t: TestContext, room: GameRoom) {
   t.mock.timers.tick(500);
   assert.equal(room.getState(), 'racing');
   assert.equal(room.startGame(), false, 'an active race cannot be restarted');
-  t.mock.timers.tick(100);
+  room.handleInput('host', {
+    ...DEFAULT_INPUT_STATE, accelerate: true, sequence: 1, timestamp: Date.now(),
+  });
+  for (let frame = 0; frame < 180 && room.getState() === 'racing'; frame++) {
+    t.mock.timers.tick(GAME_CONSTANTS.PHYSICS_DELTA);
+  }
   assert.equal(room.getState(), 'results');
   assert.equal(room.getResults().length, 1);
   assert.equal(room.getCar('host')?.finished, true);
@@ -148,12 +153,12 @@ function startDrivingRace(t: TestContext, keepCheckpoint = false) {
 
 test('respawning after long-distance driving stays near the current world tile', t => {
   const room = startDrivingRace(t, true);
-  for (let frame = 0; frame < 900; frame++) t.mock.timers.tick(GAME_CONSTANTS.PHYSICS_DELTA);
+  for (let frame = 0; frame < 1200; frame++) t.mock.timers.tick(GAME_CONSTANTS.PHYSICS_DELTA);
   const before = { ...room.getCar('host')!.position };
   assert.ok(before.y < -10000);
   room.handleInput('host', { ...DEFAULT_INPUT_STATE, sequence: 2, timestamp: Date.now() });
   room.handleRespawn('host');
-  const expected = { x: 150, y: 150 + Math.round((before.y - 150) / 600) * 600 };
+  const expected = { x: 150, y: 100 + Math.round((before.y - 100) / 600) * 600 };
   assert.deepEqual(room.getCar('host')!.position, expected);
   t.mock.timers.tick(GAME_CONSTANTS.PHYSICS_DELTA * 2);
   assert.deepEqual(room.getCar('host')!.position, expected, 'physics retains the world-space respawn');

@@ -47,6 +47,11 @@ export function cloneInputState(input: InputState): InputState {
   return { ...input };
 }
 
+export function getSteeringInput(input: Pick<InputState, 'steerLeft' | 'steerRight' | 'steerValue'>): number {
+  if (input.steerValue !== undefined && input.steerValue !== 0) return input.steerValue;
+  return input.steerLeft ? -1 : input.steerRight ? 1 : 0;
+}
+
 export function areInputsEqual(a: InputState, b: InputState): boolean {
   return (
     a.accelerate === b.accelerate &&

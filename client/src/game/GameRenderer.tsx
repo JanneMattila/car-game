@@ -1,10 +1,12 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import * as PIXI from 'pixi.js';
-import { RoomInfo, CarState, CAR_COLORS, Track, CarColor, PHYSICS_CONSTANTS } from '@shared';
+import { RoomInfo, CarState, CAR_COLORS, Track, CarColor, PHYSICS_CONSTANTS, sampleRoadCurve, roadStrokeWidth, roadKerbDashes, finishMarkings, sceneryShapes } from '@shared';
 import { useGameStore } from '../store/gameStore';
 import { useNetworkStore } from '../store/networkStore';
 import { debugLogger } from '../utils/debugLogger';
 import { startRendererSession } from './rendererSession';
+import { createRaceCamera, updateRaceCamera } from './raceCamera';
+import { rendererFrameStats } from './frameStats';
 
 interface GameRendererProps {
   containerRef: React.RefObject<HTMLDivElement>;
@@ -18,7 +20,8 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
   const carsRef = useRef<Map<string, PIXI.Container>>(new Map());
   const trackContainerRef = useRef<PIXI.Container | null>(null);
   const tireMarksContainerRef = useRef<PIXI.Container | null>(null);
-  const cameraRef = useRef({ x: 0, y: 0 });
+  const cameraRef = useRef(createRaceCamera());
+  const cameraRespawningRef = useRef(false);
   const lastTimeRef = useRef<number>(performance.now());
   const debugCounterRef = useRef(0);
   const [pixiReady, setPixiReady] = useState(false);
@@ -26,14 +29,14 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
   // Dynamic tile management for infinite scrolling
   const tilesContainerRef = useRef<PIXI.Container | null>(null);
   const renderedTilesRef = useRef<Map<string, PIXI.Container>>(new Map());
-  const lastTileUpdateRef = useRef({ x: 0, y: 0 });
+  const lastTileUpdateRef = useRef({ x: 0, y: 0, zoom: 1, width: 0, height: 0 });
   
   // Track previous positions for tire marks
   const prevCarPositionsRef = useRef<Map<string, { x: number; y: number; rotation: number }>>(new Map());
   const tireMarkCountRef = useRef(0);
   const MAX_TIRE_MARKS = 100; // Limit total marks for performance
   
-  const { interpolateCars } = useGameStore();
+  const interpolateCars = useGameStore(state => state.interpolateCars);
   const currentTrack = useNetworkStore(state => state.track);
 
   // Initialize PIXI
@@ -42,7 +45,13 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
     if (!container) return;
     setPixiReady(false);
     const app = new PIXI.Application();
-    const onTick = () => renderLoopRef.current();
+    const resetFrameStats = () => rendererFrameStats.reset();
+    const onTick = () => {
+      renderLoopRef.current();
+      if (document.visibilityState === 'visible') {
+        rendererFrameStats.recordFrame(performance.now());
+      }
+    };
     let resizeFrame: number | null = null;
     const handleResize = () => {
       const rect = container.getBoundingClientRect();
@@ -83,6 +92,8 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
         handleResize();
         resizeObserver.observe(container);
         window.addEventListener('resize', scheduleResize);
+        document.addEventListener('visibilitychange', resetFrameStats);
+        resetFrameStats();
         lastTimeRef.current = performance.now();
         app.ticker.add(onTick);
         setPixiReady(true);
@@ -93,10 +104,12 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
         app.ticker.stop();
         resizeObserver.disconnect();
         window.removeEventListener('resize', scheduleResize);
+        document.removeEventListener('visibilitychange', resetFrameStats);
         if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
         app.destroy(true, { children: true });
         // A cancelled initialization must not clear a newer session's scene.
         if (appRef.current === app) {
+          resetFrameStats();
           appRef.current = null;
           trackContainerRef.current = null;
           tilesContainerRef.current = null;
@@ -104,7 +117,7 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
           carsRef.current.clear();
           renderedTilesRef.current.clear();
           prevCarPositionsRef.current.clear();
-          cameraRef.current = { x: 0, y: 0 };
+          cameraRef.current = createRaceCamera();
         }
       },
       onError: error => {
@@ -128,11 +141,41 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
     // Draw background for entire tile
     const background = new PIXI.Graphics();
     background.rect(offsetX, offsetY, wrapCycleX, wrapCycleY);
-    background.fill(0x1a1a2e);
+    background.fill(track.backgroundColor ?? 0x1a1a2e);
     tileContainer.addChild(background);
+
+    for (const item of track.scenery ?? []) {
+      const container = new PIXI.Container();
+      container.position.set(item.position.x + offsetX, item.position.y + offsetY);
+      container.rotation = item.rotation;
+      container.scale.set(item.scale);
+      const g = new PIXI.Graphics();
+      for (const shape of sceneryShapes(item)) {
+        if (shape.kind === 'rect') g.rect(shape.x, shape.y, shape.width, shape.height).fill(shape.color);
+        else if (shape.kind === 'circle') g.circle(shape.x, shape.y, shape.radius).fill(shape.color);
+        else if (shape.kind === 'ellipse') {
+          g.ellipse(shape.x, shape.y, shape.radiusX, shape.radiusY).fill(shape.color);
+        } else {
+          g.moveTo(shape.x, shape.y).lineTo(shape.endX, shape.endY)
+            .stroke({ color: shape.color, width: shape.width });
+        }
+      }
+      container.addChild(g);
+      if (item.label) {
+        const label = new PIXI.Text({
+          text: item.label,
+          style: { fontFamily: 'sans-serif', fontSize: item.type === 'label' ? 28 : 14, fill: 0xedf2ef },
+        });
+        label.anchor.set(0.5, 1);
+        label.position.y = item.type === 'label' ? 0 : 50;
+        container.addChild(label);
+      }
+      tileContainer.addChild(container);
+    }
     
     // Helper to draw an element at a position
-    const drawElement = (element: typeof track.elements[0], baseX: number, baseY: number) => {
+    const drawElement = (element: typeof track.elements[0], baseX: number, baseY: number,
+      roadPass: 'base' | 'surface' = 'surface') => {
       const x = baseX;
       const y = baseY;
       const width = element.width || 100;
@@ -170,33 +213,37 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
         }
         case 'road_curve': {
           const g = new PIXI.Graphics();
-          const radius = Math.min(width, height) / 2;
-          g.stroke({ color: 0x3a3a5e, width: Math.min(width, height) * 0.6, alpha: 1 });
-          g.arc(0, 0, radius * 0.8, -Math.PI / 2, 0);
-          g.position.set(cx, cy);
-          g.rotation = rotation;
+          const points = sampleRoadCurve(element);
+          const roadWidth = roadStrokeWidth(element);
+          const stroke = (path: typeof points, color: number, strokeWidth: number, cap: 'round' | 'butt' = 'round') => {
+            path.forEach((p, i) => i === 0 ? g.moveTo(p.x, p.y) : g.lineTo(p.x, p.y));
+            g.stroke({ color, width: strokeWidth, cap, join: 'round' });
+          };
+          if (roadPass === 'base' && element.properties?.kerbs) {
+            stroke(points, 0xf4f1e9, roadWidth + 24);
+            roadKerbDashes(points).forEach(dash => stroke(dash, 0xdf4349, roadWidth + 24, 'butt'));
+            stroke(points, 0xeceef1, roadWidth + 4);
+          }
+          if (roadPass === 'surface') {
+            stroke(points, element.properties?.bezier ? 0x444953 : 0x3a3a5e, roadWidth);
+          }
+          g.position.set(baseX - element.x, baseY - element.y);
           tileContainer.addChild(g);
           break;
         }
+        case 'barrier':
         case 'wall': {
           addRect(0x8B0000, 0xff4444);
           break;
         }
         case 'finish': {
-          const finishContainer = new PIXI.Container();
-          finishContainer.position.set(cx, cy);
-          finishContainer.rotation = rotation;
-          const squareSize = 10;
-          for (let i = -width / 2; i < width / 2; i += squareSize) {
-            for (let j = -height / 2; j < height / 2; j += squareSize) {
-              const isWhite = (Math.floor((i + width / 2) / squareSize) + Math.floor((j + height / 2) / squareSize)) % 2 === 0;
-              const square = new PIXI.Graphics();
-              square.rect(i, j, squareSize, squareSize);
-              square.fill(isWhite ? 0xffffff : 0x000000);
-              finishContainer.addChild(square);
-            }
+          const graphics = new PIXI.Graphics();
+          graphics.position.set(x - element.x, y - element.y);
+          for (const marking of finishMarkings(track, element)) {
+            graphics.poly(marking.points.flatMap(p => [p.x, p.y]), true)
+              .fill(marking.white ? 0xffffff : 0x000000);
           }
-          tileContainer.addChild(finishContainer);
+          tileContainer.addChild(graphics);
           break;
         }
         case 'checkpoint':
@@ -257,14 +304,12 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
         return (order[a.type] || 0) - (order[b.type] || 0);
       });
 
-      sortedElements.forEach((element) => {
+      const drawWithWrap = (element: typeof track.elements[0], roadPass: 'base' | 'surface') => {
         const elX = element.x ?? element.position?.x ?? 0;
         const elY = element.y ?? element.position?.y ?? 0;
-        const elWidth = element.width || 100;
-        const elHeight = element.height || 100;
         
         // Draw element at its normal position within this tile
-        drawElement(element, elX + offsetX, elY + offsetY);
+        drawElement(element, elX + offsetX, elY + offsetY, roadPass);
         
         // For wrap-around tracks, also draw elements that wrap into the margin zone
         if (track.wrapAround) {
@@ -272,18 +317,22 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
           
           // If element is near left edge, also draw it wrapped to the right (filling the margin)
           if (elX < margin) {
-            drawElement(element, elX + track.width + offsetX, elY + offsetY);
+            drawElement(element, elX + track.width + offsetX, elY + offsetY, roadPass);
           }
           // If element is near top edge, also draw it wrapped to the bottom
           if (elY < margin) {
-            drawElement(element, elX + offsetX, elY + track.height + offsetY);
+            drawElement(element, elX + offsetX, elY + track.height + offsetY, roadPass);
           }
           // Corner case: near both edges
           if (elX < margin && elY < margin) {
-            drawElement(element, elX + track.width + offsetX, elY + track.height + offsetY);
+            drawElement(element, elX + track.width + offsetX, elY + track.height + offsetY, roadPass);
           }
         }
-      });
+      };
+      // Lay all kerbs first so segment caps cannot cut across adjoining asphalt.
+      sortedElements.filter(element => element.type === 'road_curve')
+        .forEach(element => drawWithWrap(element, 'base'));
+      sortedElements.forEach(element => drawWithWrap(element, 'surface'));
     }
     
     return tileContainer;
@@ -378,9 +427,11 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
     // Interpolate car positions for smooth display
     interpolateCars(deltaTime);
 
-    const { cars: currentCars } = useGameStore.getState();
-    const screenWidth = appRef.current.renderer.width;
-    const screenHeight = appRef.current.renderer.height;
+    const { cars: currentCars, respawning } = useGameStore.getState();
+    if (respawning && !cameraRespawningRef.current) cameraRef.current = createRaceCamera();
+    cameraRespawningRef.current = respawning;
+    const screenWidth = appRef.current.screen.width;
+    const screenHeight = appRef.current.screen.height;
 
     // Update camera to follow local player
     if (localPlayerId && currentCars.has(localPlayerId)) {
@@ -392,18 +443,8 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
       if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) {
         console.error('Invalid car displayPosition for camera:', { targetX, targetY, playerId: localPlayerId });
       } else {
-        // displayPosition is in continuous (unwrapped) space for the local player,
-        // so camera simply follows it with lerp. No wrap detection needed.
-        if (cameraRef.current.x === 0 && cameraRef.current.y === 0) {
-          // First frame: snap camera to car position
-          cameraRef.current.x = targetX;
-          cameraRef.current.y = targetY;
-        } else {
-          // Smooth camera follow (frame-rate-independent)
-          const lerpFactor = 1 - Math.pow(0.9, deltaTime * 60);
-          cameraRef.current.x += (targetX - cameraRef.current.x) * lerpFactor;
-          cameraRef.current.y += (targetY - cameraRef.current.y) * lerpFactor;
-        }
+        cameraRef.current = updateRaceCamera(cameraRef.current,
+          localCar.displayPosition, localCar.velocity, deltaTime);
       }
     }
 
@@ -435,8 +476,11 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
     }
 
     // Apply camera transform
-    trackContainerRef.current.x = screenWidth / 2 - cameraRef.current.x;
-    trackContainerRef.current.y = screenHeight / 2 - cameraRef.current.y;
+    const cameraZoom = cameraRef.current.zoom;
+    trackContainerRef.current.scale.set(cameraZoom);
+    trackContainerRef.current.x = screenWidth / 2 - cameraRef.current.x * cameraZoom;
+    trackContainerRef.current.y = screenHeight / 2 - cameraRef.current.y * cameraZoom;
+    appRef.current.canvas.dataset.cameraZoom = cameraZoom.toFixed(3);
     
     // Update visible tiles for infinite scrolling (only check periodically for performance)
     if (currentTrack) {
@@ -444,9 +488,17 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
       const dx = Math.abs(cameraRef.current.x - lastTileUpdateRef.current.x);
       const dy = Math.abs(cameraRef.current.y - lastTileUpdateRef.current.y);
       
-      if (dx > tileMoveThreshold || dy > tileMoveThreshold || renderedTilesRef.current.size === 0) {
-        updateVisibleTiles(currentTrack, cameraRef.current.x, cameraRef.current.y, screenWidth, screenHeight);
-        lastTileUpdateRef.current = { x: cameraRef.current.x, y: cameraRef.current.y };
+      const lastView = lastTileUpdateRef.current;
+      if (dx > tileMoveThreshold || dy > tileMoveThreshold ||
+        Math.abs(cameraZoom - lastView.zoom) > 0.01 ||
+        screenWidth !== lastView.width || screenHeight !== lastView.height ||
+        renderedTilesRef.current.size === 0) {
+        updateVisibleTiles(currentTrack, cameraRef.current.x, cameraRef.current.y,
+          screenWidth / cameraZoom, screenHeight / cameraZoom);
+        lastTileUpdateRef.current = {
+          x: cameraRef.current.x, y: cameraRef.current.y, zoom: cameraZoom,
+          width: screenWidth, height: screenHeight,
+        };
       }
     }
     
@@ -455,6 +507,7 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
       debugLogger.log('CAMERA', 'Camera transform applied', {
         screenSize: { width: screenWidth, height: screenHeight },
         cameraPos: { x: cameraRef.current.x, y: cameraRef.current.y },
+        zoom: cameraZoom,
         containerPos: { x: trackContainerRef.current.x, y: trackContainerRef.current.y },
         canvasSize: { 
           width: appRef.current.canvas.width, 
@@ -733,7 +786,9 @@ function GameRenderer({ containerRef, room, localPlayerId }: GameRendererProps) 
     trackContainerRef.current.removeChildren();
     
     // Reset camera offset for new track
-    lastTileUpdateRef.current = { x: 0, y: 0 };
+    lastTileUpdateRef.current = { x: 0, y: 0, zoom: 1, width: 0, height: 0 };
+    cameraRef.current = createRaceCamera();
+    cameraRespawningRef.current = false;
     renderedTilesRef.current.clear();
     
     // Initialize camera to track center or spawn element

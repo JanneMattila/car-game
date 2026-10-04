@@ -1,7 +1,7 @@
 // Client-side prediction with server reconciliation
 // Provides smooth movement by predicting locally and correcting when server responds
 
-import { PHYSICS_CONSTANTS } from '@shared';
+import { PHYSICS_CONSTANTS, getSteeringInput, Track, WallPredictionWorld, stepNitro, RoadSurfaceIndex, drivingResistance, PredictionOpponent } from '@shared';
 
 interface PredictedState {
   x: number;
@@ -10,6 +10,9 @@ interface PredictedState {
   vx: number;
   vy: number;
   angularVelocity: number;
+  /** Omitted only by legacy callers starting with a full tank. */
+  nitroAmount?: number;
+  layer?: number;
 }
 
 interface InputRecord {
@@ -31,6 +34,9 @@ let predictedState: PredictedState | null = null;
 let currentInput: InputRecord | null = null; // Current held input for continuous simulation
 let physicsAccumulator = 0; // Accumulates real time, drained in fixed DELTA_TIME steps
 let previousState: PredictedState | null = null; // Previous physics state for render interpolation
+let predictionTrack: Track | null = null;
+let wallWorld: WallPredictionWorld | null = null;
+let roadSurface: RoadSurfaceIndex | null = null;
 
 // Debug telemetry – readable by the debug overlay
 export interface ReconciliationDebugInfo {
@@ -43,6 +49,10 @@ export interface ReconciliationDebugInfo {
   snapped: boolean;
   serverUpdateCount: number;
   lastServerUpdateTime: number;
+  wallContacts: number;
+  wallCollisionSteps: number;
+  carContacts: number;
+  carCollisionSteps: number;
 }
 
 const _debugInfo: ReconciliationDebugInfo = {
@@ -55,11 +65,31 @@ const _debugInfo: ReconciliationDebugInfo = {
   snapped: false,
   serverUpdateCount: 0,
   lastServerUpdateTime: 0,
+  wallContacts: 0,
+  wallCollisionSteps: 0,
+  carContacts: 0,
+  carCollisionSteps: 0,
 };
 
 /** Get reconciliation debug info (read-only snapshot) */
 export function getReconciliationDebug(): Readonly<ReconciliationDebugInfo> {
   return _debugInfo;
+}
+
+export function setPredictionTrack(track: Track | null, reset = false): void {
+  if (predictionTrack === track && !reset) return;
+  wallWorld?.dispose();
+  predictionTrack = track;
+  roadSurface = track ? new RoadSurfaceIndex(track) : null;
+  wallWorld = track ? new WallPredictionWorld(track) : null;
+  _debugInfo.wallContacts = 0;
+  _debugInfo.carContacts = 0;
+}
+
+export function setPredictionOpponents(cars: readonly PredictionOpponent[]): void {
+  if (!wallWorld && cars.length > 0) wallWorld = new WallPredictionWorld(predictionTrack);
+  wallWorld?.setOpponents(cars);
+  _debugInfo.carContacts = wallWorld?.carContacts ?? 0;
 }
 
 // Physics constants for local prediction (simplified)
@@ -98,7 +128,7 @@ export function recordInput(input: InputRecord): void {
 export function predictLocalMovement(
   currentState: PredictedState,
   input: InputRecord
-): PredictedState {
+): PredictedState & { nitroAmount: number } {
   const result = simulateStep(currentState, input);
   predictedState = result;
   return result;
@@ -130,17 +160,20 @@ export function predictFrame(deltaTime: number = DELTA_TIME): PredictedState | n
   // alpha = fraction of a physics step that has elapsed since the last step.
   if (previousState && predictedState) {
     const alpha = physicsAccumulator / DELTA_TIME;
-    return {
+    const display = {
       x: previousState.x + (predictedState.x - previousState.x) * alpha,
       y: previousState.y + (predictedState.y - previousState.y) * alpha,
       rotation: previousState.rotation + (predictedState.rotation - previousState.rotation) * alpha,
       vx: predictedState.vx,
       vy: predictedState.vy,
       angularVelocity: predictedState.angularVelocity,
+      nitroAmount: predictedState.nitroAmount,
+      layer: predictedState.layer,
     };
+    return wallWorld?.constrain(display) ?? display;
   }
   
-  return predictedState;
+  return predictedState ? wallWorld?.constrain(predictedState) ?? predictedState : null;
 }
 
 /**
@@ -156,19 +189,24 @@ export function predictFrame(deltaTime: number = DELTA_TIME): PredictedState | n
  *              + (F / m) × dt²
  *
  * Key server constants baked in:
- *   body { density: 0.002, 30×20 rect → mass = 1.2,
+ *   body { 30×50 rect → mass = 1.2,
  *          frictionAir: 0.01, inertia: Infinity }
  *   Engine.update(engine, 1000/60)  → dt = baseDt → time-correction = 1
  */
 
 // ── Server-matching constants ──────────────────────────────────────
-const SERVER_BODY_MASS  = 1.2;           // density(0.002) × area(30×20)
+const SERVER_BODY_MASS  = PHYSICS_CONSTANTS.CAR_BODY_MASS;
 const MATTER_DT         = 1000 / 60;     // ms – same as baseDelta
 const MATTER_DT_SQUARED = MATTER_DT * MATTER_DT; // ≈ 277.78
 const MATTER_FRICTION_AIR = 1 - 0.01;    // 0.99 – body.frictionAir = 0.01
 
-function simulateStep(state: PredictedState, input: InputRecord): PredictedState {
+function simulateStep(state: PredictedState, input: InputRecord): PredictedState & { nitroAmount: number } {
   let { x, y, rotation, vx, vy, angularVelocity } = state;
+  const nitro = stepNitro(state.nitroAmount ?? PHYSICS_CONSTANTS.NITRO_MAX, input.nitro, DELTA_TIME);
+  const resistance = drivingResistance(
+    roadSurface ? roadSurface.isAsphalt({ x, y }, state.layer ?? 0) : true,
+    wallWorld?.forceScale ?? 1
+  );
 
   // Forward direction (same convention as server)
   const forwardX = Math.sin(rotation);
@@ -186,14 +224,14 @@ function simulateStep(state: PredictedState, input: InputRecord): PredictedState
 
   // Acceleration – server: applyForce( rotate((0, -ENGINE_FORCE*0.001), angle) )
   if (input.accelerate && speed < PHYSICS_CONSTANTS.MAX_SPEED) {
-    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001;
-    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001;
+    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001 * resistance.forceScale;
+    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001 * resistance.forceScale;
   }
 
   // Nitro boost – server: applyForce( rotate((0, -ENGINE_FORCE*0.0015), angle) )
-  if (input.nitro) {
-    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015;
-    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015;
+  if (nitro.boostScale > 0) {
+    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015 * nitro.boostScale * resistance.forceScale;
+    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015 * nitro.boostScale * resistance.forceScale;
   }
 
   // ── 2. Direct velocity modifications (setVelocity on server) ────
@@ -206,20 +244,13 @@ function simulateStep(state: PredictedState, input: InputRecord): PredictedState
       vy *= 0.95;
     } else if (speed < PHYSICS_CONSTANTS.MAX_REVERSE_SPEED) {
       // Server: reverse via applyForce
-      forceX -= forwardX * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001;
-      forceY -= forwardY * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001;
+      forceX -= forwardX * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001 * resistance.forceScale;
+      forceY -= forwardY * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001 * resistance.forceScale;
     }
   }
 
   // ── 3. Steering (angular velocity) ─────────────────────────────
-  let steerInput = 0;
-  if (input.steerValue !== undefined && input.steerValue !== 0) {
-    steerInput = input.steerValue;
-  } else if (input.steerLeft) {
-    steerInput = -1;
-  } else if (input.steerRight) {
-    steerInput = 1;
-  }
+  const steerInput = getSteeringInput(input);
 
   if (steerInput !== 0) {
     const minTurnSpeed = 0.5;
@@ -249,15 +280,15 @@ function simulateStep(state: PredictedState, input: InputRecord): PredictedState
 
   // ── 4. Drag (matches server: setVelocity *= (1 − drag·speed − rolling)) ─
   const dragForce = PHYSICS_CONSTANTS.DRAG_COEFFICIENT * speed;
-  const rollingResistance = PHYSICS_CONSTANTS.ROLLING_RESISTANCE;
+  const rollingResistance = resistance.rollingResistance;
   const dragFactor = 1 - dragForce - rollingResistance;
   vx *= dragFactor;
   vy *= dragFactor;
 
   // ── 5. Speed clamp (server uses pre-drag `speed` for comparison) ─
-  const maxSpeed = input.nitro
+  const maxSpeed = resistance.speedScale * (nitro.boostScale > 0
     ? PHYSICS_CONSTANTS.MAX_SPEED * PHYSICS_CONSTANTS.NITRO_BOOST_MULTIPLIER
-    : PHYSICS_CONSTANTS.MAX_SPEED;
+    : PHYSICS_CONSTANTS.MAX_SPEED);
   if (speed > maxSpeed) {
     const ratio = maxSpeed / speed;
     vx *= ratio;
@@ -278,7 +309,13 @@ function simulateStep(state: PredictedState, input: InputRecord): PredictedState
   y += vy;
 
   // Both server and client use continuous world coordinates.
-  return { x, y, rotation, vx, vy, angularVelocity };
+  const next = { x, y, rotation, vx, vy, angularVelocity };
+  const result = wallWorld ? wallWorld.resolve(state, next) : next;
+  _debugInfo.wallContacts = wallWorld?.contacts ?? 0;
+  if (_debugInfo.wallContacts > 0) _debugInfo.wallCollisionSteps++;
+  _debugInfo.carContacts = wallWorld?.carContacts ?? 0;
+  if (_debugInfo.carContacts > 0) _debugInfo.carCollisionSteps++;
+  return { ...result, nitroAmount: nitro.amount, layer: state.layer ?? 0 };
 }
 
 /**
@@ -304,6 +341,10 @@ export function reconcileWithServer(
   lastConfirmedSequence = serverSequence;
   
   const target = serverState;
+  if (predictedState && target.layer !== undefined) predictedState.layer = target.layer;
+  if (predictedState && target.nitroAmount !== undefined) {
+    predictedState.nitroAmount = target.nitroAmount;
+  }
   
   // If no prior prediction, just accept server state
   if (!predictedState) {
@@ -354,6 +395,9 @@ export function reconcileWithServer(
   const BLEND_FACTOR   = 0.1; // 10 % correction per server update (~20 Hz)
   
   if (dist > SNAP_THRESHOLD) {
+    wallWorld?.reset();
+    _debugInfo.wallContacts = 0;
+    _debugInfo.carContacts = 0;
     // Large discrepancy – hard snap
     predictedState.x = target.x;
     predictedState.y = target.y;
@@ -387,7 +431,11 @@ export function getPredictedState(): PredictedState | null {
 /**
  * Initialize prediction with server state
  */
-export function initializePrediction(state: PredictedState): void {
+export function initializePrediction(state: PredictedState, track: Track | null = null): void {
+  setPredictionTrack(null, true);
+  setPredictionTrack(track);
+  _debugInfo.wallCollisionSteps = 0;
+  _debugInfo.carCollisionSteps = 0;
   predictedState = { ...state, angularVelocity: state.angularVelocity ?? 0 };
   previousState = null;
   pendingInputs.length = 0;
@@ -410,6 +458,9 @@ export function initializePrediction(state: PredictedState): void {
  * Clear all prediction state
  */
 export function clearPrediction(): void {
+  setPredictionTrack(null, true);
+  _debugInfo.wallCollisionSteps = 0;
+  _debugInfo.carCollisionSteps = 0;
   predictedState = null;
   previousState = null;
   pendingInputs.length = 0;
@@ -423,6 +474,9 @@ export function clearPrediction(): void {
  * Keeps position but clears velocity and pending inputs
  */
 export function resetPredictionVelocity(): void {
+  wallWorld?.reset();
+  _debugInfo.wallContacts = 0;
+  _debugInfo.carContacts = 0;
   if (predictedState) {
     predictedState.vx = 0;
     predictedState.vy = 0;

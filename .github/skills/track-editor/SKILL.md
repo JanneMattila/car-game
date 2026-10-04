@@ -132,18 +132,43 @@ interface TrackElement {
 - Duplicate and delete selected elements
 
 **Curve System:**
-- Curve preset library (45°/90° left/right)
-- Custom curve drawing mode
-- Curve auto-snapping to nearby road endpoints
+- Curve studio presets (45°/90° left/right, hairpins, S-bend, custom/straight)
+- Cubic Bézier roads with draggable start/end and tangent handles
+- Independent road width, red/white kerbs, exact world-coordinate controls
+- Curve endpoint snapping with tangent alignment on the current layer
+- Legacy quarter-circle conversion to editable curves
+- Shared geometry in `shared/utils/roadGeometry.ts` for editor, game and minimap
+
+**Large-Track Navigation:**
+- Viewport-sized canvas, pointer-anchored wheel zoom and Space/middle-drag pan
+- Fit track (F), independent grid visibility/snapping and marker visibility
+- World/viewport-aware fit and minimum zoom, including large city layouts on mobile
+- Collapsible responsive panels, undo/redo and input-safe keyboard shortcuts
 
 **Layers & Properties:**
 - Per-element layer assignment (-1, 0, 1, 2)
 - Per-element width/height/position/rotation editing
 - Checkpoint ordering controls
+- Directional, swept race gates with automatic barrier-to-barrier span (including runoff)
+- Race gate inspector with effective width, forward arrows, manual fit, undo and coverage warnings
+- Finish markings have independent visible width/offset controls with undo, and are always clipped to same-layer asphalt in the editor, game and minimap
+- Dashed cyan guides show hidden grass/runoff detection; fitting barriers preserves marking position/width
+- `npm run tracks:migrate-finishes` migrates every legacy saved finish without changing road layouts or crossing planes
+- Gate selection matches the rendered span, with screen-space tolerance at city-wide zoom
+- Urban Pacific City template with coordinated 220-360-unit roads, grid, checkpoints and barriers
+- Shared vector scenery footprints/colors in editor, game and minimap; see track.md for supported types
 
 **Persistence & Loading:**
 - Save and load tracks from server storage
 - Track list dialog for quick load/copy/delete
+- Searchable/category-filtered picker with 27 templates: 23 F1 venues, three NASCAR speedways and Pacific City; Silverstone is available through Load
+- F1 collection covers all 24 announced 2026 venues including Madrid and Barcelona; original arcade interpretations, with a separated Suzuka crossover
+- SVG previews reuse road Bezier definitions without constructing full barriers
+- Adjustable template road width rebuilds roads, barriers, race markers and an eight-car grid together
+- Templates create independent IDs, preserve saved originals and support full-canvas undo/redo
+- Template picker traps focus and closes with Escape; save confirmation is inline and load/save failures use dismissible error banners
+- Shared construction in `shared/utils/circuitBuilder.ts` and definitions in `shared/tracks/circuitTemplates.ts`
+- `npm run tracks:generate` regenerates the 27 template JSON files; pass IDs to regenerate selected tracks only, preserving Silverstone and player data
 
 **UI/UX:**
 - Collapsible left/right panels with resize handles

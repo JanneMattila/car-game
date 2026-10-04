@@ -4,6 +4,7 @@ import { Track, TrackValidationResult, TrackValidationError, CURRENT_TRACK_VERSI
 import { GameSettings } from '../types/game';
 import { GAME_CONSTANTS } from '../constants/game';
 import { vec2Distance } from './math';
+import { fitRaceGate } from './raceGates';
 
 export function validateNickname(nickname: string): { valid: boolean; error?: string } {
   if (!nickname || nickname.trim().length === 0) {
@@ -48,6 +49,16 @@ export function validateGameSettings(settings: GameSettings): { valid: boolean; 
 export function validateTrack(track: Track): TrackValidationResult {
   const errors: TrackValidationError[] = [];
   const warnings: string[] = [];
+  for (const item of track.scenery ?? []) {
+    if ((item.width !== undefined && (!Number.isFinite(item.width) || item.width < 20)) ||
+        (item.height !== undefined && (!Number.isFinite(item.height) || item.height < 20)) ||
+        (item.color !== undefined && !/^#[0-9a-f]{6}$/i.test(item.color))) {
+      errors.push({
+        code: 'INVALID_SCENERY', element: item.id,
+        message: 'Scenery footprints must be at least 20 units; colors must be six-digit hex colors.',
+      });
+    }
+  }
 
   // Check track version
   if (track.version === undefined || track.version === null) {
@@ -60,6 +71,62 @@ export function validateTrack(track: Track): TrackValidationResult {
   }
 
   // Check for required elements in the track elements array
+  if (track.backgroundColor !== undefined && !/^#[0-9a-f]{6}$/i.test(track.backgroundColor)) {
+    errors.push({ code: 'INVALID_BACKGROUND', message: 'Background color must be a six-digit hex color.' });
+  }
+  for (const element of track.elements ?? []) {
+    if (element.type === 'finish' &&
+        ((element.properties?.finishVisibleWidth !== undefined &&
+          (!Number.isFinite(element.properties.finishVisibleWidth) ||
+           element.properties.finishVisibleWidth < 0)) ||
+         (element.properties?.finishVisibleOffset !== undefined &&
+          !Number.isFinite(element.properties.finishVisibleOffset)))) {
+      errors.push({
+        code: 'INVALID_FINISH_MARKINGS', element: element.id,
+        message: 'Finish markings need a finite non-negative width and a finite lateral offset.',
+      });
+    }
+    if (element.type === 'finish' || element.type === 'checkpoint') {
+      if (!Number.isFinite(element.x) || !Number.isFinite(element.y) ||
+          !Number.isFinite(element.width) || element.width <= 0 ||
+          !Number.isFinite(element.height) || element.height <= 0 ||
+          !Number.isFinite(element.rotation) ||
+          (element.properties?.autoGateWidth !== undefined &&
+           typeof element.properties.autoGateWidth !== 'boolean')) {
+        errors.push({
+          code: 'INVALID_RACE_GATE', element: element.id,
+          message: 'Race gates need finite positions, positive dimensions, a rotation and a boolean auto-fit setting.',
+        });
+      } else {
+        const fitted = fitRaceGate(track, element);
+        if (fitted === element) {
+          warnings.push(`Gate ${element.id} has no nearby barrier pair. Its manual width must cover all drivable ground.`);
+        } else if (element.properties?.autoGateWidth === false && fitted.width > element.width + 1) {
+          warnings.push(`Gate ${element.id} leaves runoff uncovered. Enable automatic barrier span or fit its width.`);
+        }
+      }
+    }
+    if (element.properties?.bezier === undefined) continue;
+    const curve = element.properties.bezier;
+    const validPoint = (p: { x: number; y: number } | undefined) =>
+      p && Number.isFinite(p.x) && Number.isFinite(p.y) &&
+      p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1;
+    if (element.type !== 'road_curve' || !curve ||
+      !validPoint(curve.start) || !validPoint(curve.control1) ||
+      !validPoint(curve.control2) || !validPoint(curve.end) ||
+      !Number.isFinite(element.properties.roadWidth) || (element.properties.roadWidth ?? 0) < 20 ||
+      !Number.isFinite(element.width) || element.width <= 0 ||
+      !Number.isFinite(element.height) || element.height <= 0 ||
+      !Number.isFinite(element.x) || !Number.isFinite(element.y) ||
+      !Number.isFinite(element.rotation)) {
+      errors.push({
+        code: 'INVALID_ROAD_CURVE',
+        message: 'Curves require four normalized control points, positive dimensions and a road width of at least 20.',
+        element: element.id,
+      });
+    }
+  }
+
   const finishElements = track.elements?.filter(el => el.type === 'finish') || [];
   if (finishElements.length === 0) {
     errors.push({ code: 'NO_FINISH', message: 'Track must have a finish line element' });

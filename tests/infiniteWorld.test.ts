@@ -24,7 +24,7 @@ test('cars keep their world position across many map tiles in every direction', 
         ...DEFAULT_INPUT_STATE, playerId: 'driver', sequence: 1, timestamp: 0, accelerate: true,
       });
       let previous = { ...car.position };
-      for (let frame = 0; frame < 900; frame++) {
+      for (let frame = 0; frame < 1200; frame++) {
         physics.update(1 / 60);
         physics.syncCarState(car);
         const forward = (car.position.x - previous.x) * dx + (car.position.y - previous.y) * dy;
@@ -107,14 +107,34 @@ test('checkpoint and finish markers repeat without relocating the car', () => {
       position: { x: 150, y: 50 }, width: 100, height: 100, rotation: 0 },
   ];
   const physics = new PhysicsEngine(map);
-  const car = createInitialCarState('car', 'driver', { x: 5800, y: -6300 }, 0);
+  const car = createInitialCarState('car', 'driver', { x: 5800, y: -6290 }, 0);
   physics.initialize([car]);
-  assert.ok(physics.update(1 / 60).some(event => event.type === 'checkpoint'));
+  assert.deepEqual(physics.update(1 / 60), [], 'standing near a gate cannot award progress');
   physics.syncCarState(car);
-  assert.deepEqual(car.position, { x: 5800, y: -6300 });
-  physics.resetCar('driver', { x: 5800, y: -6500 }, 0);
-  assert.ok(physics.update(1 / 60).some(event => event.type === 'lap' && event.lap === 1));
-  physics.syncCarState(car);
-  assert.deepEqual(car.position, { x: 5800, y: -6500 });
-  physics.reset();
+  assert.deepEqual(car.position, { x: 5800, y: -6290 });
+  physics.applyInput('driver', {
+    ...DEFAULT_INPUT_STATE, accelerate: true, sequence: 1, timestamp: 0,
+  });
+  let checkpointPassed = false;
+  let lapCompleted = false;
+  try {
+    for (let frame = 0; frame < 120 && !lapCompleted; frame++) {
+      const events = physics.update(1 / 60);
+      physics.syncCarState(car);
+      if (events.some(event => event.type === 'checkpoint')) {
+        checkpointPassed = true;
+        assert.ok(car.position.y <= -6300 && car.position.y > -6330);
+      }
+      if (events.some(event => event.type === 'lap' && event.lap === 1)) {
+        lapCompleted = true;
+        assert.ok(car.position.y <= -6500 && car.position.y > -6530);
+      }
+      assert.equal(car.position.x, 5800);
+      assert.ok(car.position.y < -6000, 'progress must not normalize the world position');
+    }
+    assert.ok(checkpointPassed);
+    assert.ok(lapCompleted);
+  } finally {
+    physics.reset();
+  }
 });

@@ -16,6 +16,7 @@ export interface Track {
   defaultLapCount: number;
   width: number;
   height: number;
+  backgroundColor?: string;
   // Infinite terrain repeats; cars retain continuous world coordinates.
   wrapAround?: boolean;
   elements: TrackElement[];
@@ -66,6 +67,15 @@ export interface TrackElement {
 }
 
 export interface TrackElementProperties {
+  // Normalized control points retain their shape when the element is resized.
+  bezier?: RoadBezier;
+  roadWidth?: number;
+  kerbs?: boolean;
+  // Race gates span nearby barriers by default; false retains the authored width.
+  autoGateWidth?: boolean;
+  // Checkerboard span and lateral offset; asphalt clipping never changes lap detection.
+  finishVisibleWidth?: number;
+  finishVisibleOffset?: number;
   // Boost pad
   boostAmount?: number;
   boostDuration?: number;
@@ -82,12 +92,23 @@ export interface TrackElementProperties {
   speedLimit?: number;
 }
 
+export interface RoadBezier {
+  start: Vector2;
+  control1: Vector2;
+  control2: Vector2;
+  end: Vector2;
+}
+
 export interface SceneryItem {
   id: string;
   type: string;
   position: Vector2;
   rotation: number;
   scale: number;
+  label?: string;
+  width?: number;
+  height?: number;
+  color?: string;
 }
 
 export interface TrackMetadata {
@@ -140,13 +161,14 @@ export const DEFAULT_TRACK: Track = {
     {
       id: 'default-finish',
       type: 'finish',
-      x: 180,
+      x: 97,
       y: 420,
-      position: { x: 180, y: 420 },
-      width: 120,
+      position: { x: 97, y: 420 },
+      width: 286,
       height: 20,
       rotation: 0,
-      layer: 0
+      layer: 0,
+      properties: { finishVisibleWidth: 120, finishVisibleOffset: 0 },
     }
   ],
   scenery: [],

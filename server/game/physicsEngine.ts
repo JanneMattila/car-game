@@ -1,5 +1,11 @@
 import Matter from 'matter-js';
-import { Track, CarState, PlayerInput, GameEvent, Vector2, PHYSICS_CONSTANTS, vec2, vec2Sub, vec2Length } from '@shared';
+import {
+  Track, TrackElement, CarState, PlayerInput, GameEvent, PHYSICS_CONSTANTS,
+  getSteeringInput, createVehicleBody, createTrackWall, stepNitro,
+  effectiveRaceGate, raceGateCrossing,
+  RoadSurfaceIndex, CollisionResistance, drivingResistance,
+  DEFAULT_INPUT_STATE,
+} from '@shared';
 
 interface CarPhysicsState {
   body: Matter.Body;
@@ -10,7 +16,7 @@ interface CarPhysicsState {
   nitroAmount: number;
   lastCheckpoint: number;
   lap: number;
-  passedFinishLine: boolean;
+  progressPosition: { x: number; y: number };
   layer: number;
   stuckStartTime: number;
   lastPosition: { x: number; y: number };
@@ -27,6 +33,10 @@ export class PhysicsEngine {
   private trackElements: Map<string, Matter.Body> = new Map();
   private pendingEvents: GameEvent[] = [];
   private _frameCount: number = 0;
+  private checkpoints: TrackElement[];
+  private finishLine: TrackElement | null;
+  private roadSurface: RoadSurfaceIndex;
+  private collisionResistance = new CollisionResistance();
 
   constructor(track: Track) {
     console.log('🚀 PHYSICS ENGINE: Constructing with track:', track.name);
@@ -34,6 +44,12 @@ export class PhysicsEngine {
     console.log('  Track has finish elements:', track.elements?.filter(el => el.type === 'finish')?.length || 0);
     
     this.track = track;
+    this.roadSurface = new RoadSurfaceIndex(track);
+    this.checkpoints = track.elements.filter(el => el.type === 'checkpoint')
+      .sort((a, b) => (a.checkpointIndex ?? 0) - (b.checkpointIndex ?? 0))
+      .map(el => effectiveRaceGate(track, el));
+    const finish = track.elements.find(el => el.type === 'finish');
+    this.finishLine = finish ? effectiveRaceGate(track, finish) : null;
     this.engine = Matter.Engine.create({
       gravity: { x: 0, y: 0 },
       positionIterations: 6,
@@ -54,7 +70,6 @@ export class PhysicsEngine {
     }
     this.updateWallTiles();
     
-    this.setupCollisionHandlers();
   }
 
   reset(): void {
@@ -64,6 +79,7 @@ export class PhysicsEngine {
     this.wallTiles.clear();
     this.trackElements.clear();
     this.pendingEvents = [];
+    this.collisionResistance.reset();
   }
 
   private createWalls(tileX: number, tileY: number): Matter.Body[] {
@@ -71,21 +87,9 @@ export class PhysicsEngine {
     const walls: Matter.Body[] = [];
     
     for (const wallEl of wallElements) {
-      const wall = Matter.Bodies.rectangle(
-        wallEl.x + wallEl.width / 2 + tileX * this.track.width,
-        wallEl.y + wallEl.height / 2 + tileY * this.track.height,
-        wallEl.width,
-        wallEl.height,
-        {
-          isStatic: true,
-          label: 'wall',
-          render: {
-            fillStyle: wallEl.type === 'barrier' ? '#8B4513' : '#666',
-            strokeStyle: '#333',
-            lineWidth: 2
-          }
-        }
-      );
+      const wall = createTrackWall(wallEl, {
+        x: tileX * this.track.width, y: tileY * this.track.height,
+      });
       
       // @ts-expect-error - Adding custom property
       wall.layer = wallEl.layer ?? 0;
@@ -148,24 +152,7 @@ export class PhysicsEngine {
     console.log('  Using carState position:', carState.position, 'rotation:', carState.rotation);
     
     // Use the position and rotation from carState (already computed from spawn points by gameRoom)
-    const body = Matter.Bodies.rectangle(
-      carState.position.x,
-      carState.position.y,
-      30,
-      20,
-      {
-        angle: carState.rotation,
-        friction: 0.001,
-        frictionAir: 0.01,
-        density: 0.002,
-        inertia: Infinity,
-        render: {
-          fillStyle: carState.color || '#ff0000',
-          strokeStyle: '#000',
-          lineWidth: 2
-        }
-      }
-    );
+    const body = createVehicleBody(carState.position, carState.rotation);
     
     const physicsState: CarPhysicsState = {
       body,
@@ -173,10 +160,10 @@ export class PhysicsEngine {
       input: null,
       nitroActive: false,
       nitroEndTime: 0,
-      nitroAmount: PHYSICS_CONSTANTS.NITRO_MAX,
+      nitroAmount: carState.nitroAmount,
       lastCheckpoint: 0,
       lap: 0,
-      passedFinishLine: false,
+      progressPosition: { ...carState.position },
       layer: 0,
       stuckStartTime: 0,
       lastPosition: { x: carState.position.x, y: carState.position.y },
@@ -200,19 +187,17 @@ export class PhysicsEngine {
     const carState = this.cars.get(playerId);
     if (!carState) return;
 
-    // Reset physics body position and rotation
-    Matter.Body.setPosition(carState.body, position);
-    Matter.Body.setAngle(carState.body, rotation);
-    
-    // Reset velocities
-    Matter.Body.setVelocity(carState.body, { x: 0, y: 0 });
-    Matter.Body.setAngularVelocity(carState.body, 0);
+    // A fresh body prevents cached contact impulses from following a teleported car.
+    Matter.World.remove(this.world, carState.body);
+    carState.body = createVehicleBody(position, rotation);
+    Matter.World.add(this.world, carState.body);
     
     // Reset car state properties
     carState.nitroActive = false;
     carState.nitroEndTime = 0;
     carState.stuckStartTime = 0;
     carState.lastPosition = { x: position.x, y: position.y };
+    carState.progressPosition = { ...position };
     carState.lastPositionTime = Date.now();
     
     console.log('🔄 PHYSICS: Reset car for player', playerId, 'to position', position);
@@ -240,6 +225,7 @@ export class PhysicsEngine {
 
     // Step physics engine
     Matter.Engine.update(this.engine, deltaTime * 1000);
+    this.collisionResistance.apply(this.engine);
 
     // Check checkpoints and lap completion
     this.checkTrackProgress();
@@ -248,9 +234,12 @@ export class PhysicsEngine {
   }
 
   private updateCar(carState: CarPhysicsState, deltaTime: number): void {
-    const { body, input } = carState;
-    
-    if (!input) return;
+    const { body } = carState;
+    const input = carState.input ?? DEFAULT_INPUT_STATE;
+    const resistance = drivingResistance(
+      this.roadSurface.isAsphalt(body.position, carState.layer),
+      this.collisionResistance.forceScale(body)
+    );
 
     // Get current speed
     const currentSpeed = Matter.Vector.magnitude(body.velocity);
@@ -263,7 +252,7 @@ export class PhysicsEngine {
 
     // Apply acceleration only if under speed limit
     if (input.accelerate && currentSpeed < PHYSICS_CONSTANTS.MAX_SPEED) {
-      const force = Matter.Vector.create(0, -PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001);
+      const force = Matter.Vector.create(0, -PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001 * resistance.forceScale);
       const worldForce = Matter.Vector.rotate(force, body.angle);
       Matter.Body.applyForce(body, body.position, worldForce);
     }
@@ -278,15 +267,13 @@ export class PhysicsEngine {
         });
       } else if (currentSpeed < PHYSICS_CONSTANTS.MAX_REVERSE_SPEED) {
         // Reverse when stopped or moving slowly
-        const reverseForce = Matter.Vector.create(0, PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001);
+        const reverseForce = Matter.Vector.create(0, PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001 * resistance.forceScale);
         const worldForce = Matter.Vector.rotate(reverseForce, body.angle);
         Matter.Body.applyForce(body, body.position, worldForce);
       }
     }
 
-    let steerInput = 0;
-    if (input.steerLeft) steerInput = -1;
-    if (input.steerRight) steerInput = 1;
+    const steerInput = getSteeringInput(input);
 
     if (steerInput !== 0) {
       // Turning requires movement - scale turn rate by speed
@@ -319,27 +306,20 @@ export class PhysicsEngine {
       Matter.Body.setAngularVelocity(body, body.angularVelocity * returnRate);
     }
 
-    // Nitro boost
-    if (input.nitro && carState.nitroAmount > 0) {
-      if (!carState.nitroActive) {
-        carState.nitroActive = true;
-      }
-      // Drain nitro
-      carState.nitroAmount = Math.max(0, carState.nitroAmount - PHYSICS_CONSTANTS.NITRO_DRAIN_RATE * deltaTime);
-      
-      // Apply boost force in forward direction
-      const boostForce = Matter.Vector.create(0, -PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015);
+    const nitro = stepNitro(carState.nitroAmount, input.nitro, deltaTime);
+    carState.nitroAmount = nitro.amount;
+    carState.nitroActive = nitro.boostScale > 0;
+    if (carState.nitroActive) {
+      const boostForce = Matter.Vector.create(
+        0, -PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015 * nitro.boostScale * resistance.forceScale
+      );
       const worldBoostForce = Matter.Vector.rotate(boostForce, body.angle);
       Matter.Body.applyForce(body, body.position, worldBoostForce);
-    } else {
-      carState.nitroActive = false;
-      // Recharge nitro when not using it
-      carState.nitroAmount = Math.min(PHYSICS_CONSTANTS.NITRO_MAX, carState.nitroAmount + PHYSICS_CONSTANTS.NITRO_RECHARGE_RATE * deltaTime);
     }
 
     // Apply drag and rolling resistance
     const dragForce = PHYSICS_CONSTANTS.DRAG_COEFFICIENT * currentSpeed;
-    const rollingResistance = PHYSICS_CONSTANTS.ROLLING_RESISTANCE;
+    const rollingResistance = resistance.rollingResistance;
     
     Matter.Body.setVelocity(body, {
       x: body.velocity.x * (1 - dragForce - rollingResistance),
@@ -347,7 +327,7 @@ export class PhysicsEngine {
     });
 
     // Enforce maximum speed limit (higher with nitro) (higher with nitro)
-    const maxSpeed = carState.nitroActive ? PHYSICS_CONSTANTS.MAX_SPEED * PHYSICS_CONSTANTS.NITRO_BOOST_MULTIPLIER : PHYSICS_CONSTANTS.MAX_SPEED;
+    const maxSpeed = resistance.speedScale * (carState.nitroActive ? PHYSICS_CONSTANTS.MAX_SPEED * PHYSICS_CONSTANTS.NITRO_BOOST_MULTIPLIER : PHYSICS_CONSTANTS.MAX_SPEED);
     if (currentSpeed > maxSpeed) {
       const speedRatio = maxSpeed / currentSpeed;
       Matter.Body.setVelocity(body, {
@@ -363,116 +343,33 @@ export class PhysicsEngine {
     }
   }
 
-  private setupCollisionHandlers(): void {
-    Matter.Events.on(this.engine, 'collisionStart', (event) => {
-      for (const pair of event.pairs) {
-        this.handleCollision(pair);
-      }
-    });
-  }
-
-  private handleCollision(pair: Matter.Pair): void {
-    // Handle collisions here
-  }
-
   // ── Checkpoint / Finish detection ───────────────────────────────────
-
-  private getCheckpoints() {
-    const checkpointElements = this.track.elements?.filter(el => el.type === 'checkpoint') || [];
-    // Sort by checkpointIndex to ensure proper order
-    checkpointElements.sort((a, b) => (a.checkpointIndex ?? 0) - (b.checkpointIndex ?? 0));
-
-    return checkpointElements.map((el, index) => ({
-      id: el.id,
-      index: el.checkpointIndex ?? index,
-      position: {
-        x: el.x + el.width / 2,
-        y: el.y + el.height / 2,
-      },
-      width: Math.max(el.width || 100, 50),
-      height: Math.max(el.height || 100, 50),
-      rotation: el.rotation || 0,
-    }));
-  }
-
-  private getFinishLine() {
-    const finishElements = this.track.elements?.filter(el => el.type === 'finish') || [];
-    if (finishElements.length === 0) return null;
-
-    const finishEl = finishElements[0]!;
-    return {
-      position: {
-        x: finishEl.x + finishEl.width / 2,
-        y: finishEl.y + finishEl.height / 2,
-      },
-      width: finishEl.width || 100,
-      height: finishEl.height || 100,
-      rotation: finishEl.rotation || 0,
-    };
-  }
 
   private checkTrackProgress(): void {
     for (const [playerId, carState] of this.cars) {
-      const position = vec2(carState.body.position.x, carState.body.position.y);
-      // Track markers repeat; the car's authoritative world position never wraps.
-      if (this.track.wrapAround) {
-        position.x = ((position.x % this.track.width) + this.track.width) % this.track.width;
-        position.y = ((position.y % this.track.height) + this.track.height) % this.track.height;
+      const previous = carState.progressPosition;
+      const current = { ...carState.body.position };
+      let lastCrossing = -1;
+      while (carState.lastCheckpoint < this.checkpoints.length) {
+        const checkpoint = this.checkpoints[carState.lastCheckpoint]!;
+        const time = raceGateCrossing(this.track, checkpoint, previous, current);
+        if (time === null || time < lastCrossing) break;
+        lastCrossing = time;
+        this.pendingEvents.push({
+          type: 'checkpoint',
+          playerId,
+          checkpoint: carState.lastCheckpoint++,
+        });
       }
-      this.checkCheckpoints(playerId, carState, position);
-      this.checkFinishLine(playerId, carState, position);
-    }
-  }
-
-  private checkCheckpoints(playerId: string, carState: CarPhysicsState, position: Vector2): void {
-    const expectedCheckpoint = carState.lastCheckpoint;
-    const checkpoints = this.getCheckpoints();
-    const checkpoint = checkpoints[expectedCheckpoint];
-
-    if (!checkpoint) return;
-
-    const dist = vec2Length(vec2Sub(position, checkpoint.position));
-    const threshold = Math.max(checkpoint.width, checkpoint.height) / 2;
-
-    if (dist < threshold) {
-      carState.lastCheckpoint = expectedCheckpoint + 1;
-
-      console.log(`📍 CHECKPOINT: Player ${playerId} passed checkpoint ${expectedCheckpoint}, next: ${expectedCheckpoint + 1}/${checkpoints.length}`);
-
-      this.pendingEvents.push({
-        type: 'checkpoint',
-        playerId,
-        checkpoint: expectedCheckpoint,
-      });
-    }
-  }
-
-  private checkFinishLine(playerId: string, carState: CarPhysicsState, position: Vector2): void {
-    const finishLine = this.getFinishLine();
-    if (!finishLine) return;
-
-    const dist = vec2Length(vec2Sub(position, finishLine.position));
-    const isNearFinish = dist < Math.max(finishLine.width, finishLine.height) / 2;
-
-    // Must pass all checkpoints first
-    const checkpoints = this.getCheckpoints();
-    const allCheckpointsPassed = carState.lastCheckpoint >= checkpoints.length;
-
-    if (isNearFinish && allCheckpointsPassed && !carState.passedFinishLine) {
-      carState.passedFinishLine = true;
-      carState.lap++;
-      carState.lastCheckpoint = 0;
-
-      console.log(`🏁 FINISH LINE: Player ${playerId} crossed finish, lap ${carState.lap}, dist=${dist.toFixed(1)}`);
-
-      this.pendingEvents.push({
-        type: 'lap',
-        playerId,
-        lap: carState.lap,
-        time: 0, // Will be calculated in game room
-      });
-    } else if (!isNearFinish) {
-      carState.passedFinishLine = false;
+      const finishTime = this.finishLine
+        ? raceGateCrossing(this.track, this.finishLine, previous, current) : null;
+      if (carState.lastCheckpoint === this.checkpoints.length &&
+          finishTime !== null && finishTime >= lastCrossing) {
+        carState.lap++;
+        carState.lastCheckpoint = 0;
+        this.pendingEvents.push({ type: 'lap', playerId, lap: carState.lap, time: 0 });
+      }
+      carState.progressPosition = current;
     }
   }
 

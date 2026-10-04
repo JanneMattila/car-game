@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate, useParams, useLocation } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useNetworkStore } from '../store/networkStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { CAR_COLORS, COLOR_ORDER, RoomState, CarColor } from '@shared';
@@ -7,7 +7,6 @@ import './WaitingRoom.css';
 
 function WaitingRoom() {
   const navigate = useNavigate();
-  const location = useLocation();
   const { roomId } = useParams();
   const { 
     room, 
@@ -27,26 +26,7 @@ function WaitingRoom() {
     requestTrackList();
   }, [requestTrackList]);
 
-  // Navigate to game when racing starts
-  useEffect(() => {
-    if (room?.state === 'countdown' || room?.state === 'racing') {
-      const target = `/room/${room.id}/game`;
-      if (location.pathname !== target) {
-        navigate(target);
-      }
-    }
-  }, [room?.state, room?.id, navigate, location.pathname]);
-
-  // Redirect if no room
-  useEffect(() => {
-    if (!room) {
-      if (location.pathname !== '/lobby') {
-        navigate('/lobby');
-      }
-    }
-  }, [room, navigate, location.pathname]);
-
-  if (!room) {
+  if (!room || room.id !== roomId) {
     return null;
   }
 
@@ -56,10 +36,11 @@ function WaitingRoom() {
   const allReady = room.players.every(p => p.ready);
   const canStart = (room.state === 'waiting' || room.state === 'results')
     && allReady && room.players.length >= 1;
+  const raceActive = room.state === 'countdown' || room.state === 'racing';
 
   const handleLeave = () => {
     leaveRoom();
-    navigate('/lobby');
+    navigate('/lobby', { replace: true });
   };
 
   const handleToggleReady = () => {
@@ -185,21 +166,32 @@ function WaitingRoom() {
         </div>
 
         <div className="action-bar">
-          <button
-            className={`btn btn-large ${localPlayer?.ready ? 'btn-secondary' : 'btn-accent'}`}
-            onClick={handleToggleReady}
-          >
-            {localPlayer?.ready ? 'Not Ready' : 'Ready!'}
-          </button>
-          
-          {isHost && (
+          {raceActive ? (
             <button
               className="btn btn-primary btn-large"
-              onClick={handleStartGame}
-              disabled={!canStart}
+              onClick={() => navigate(`/room/${room.id}/game`, { replace: true })}
             >
-              {canStart ? '🏁 Start Race' : 'Waiting for players...'}
+              Return to Race
             </button>
+          ) : (
+            <>
+              <button
+                className={`btn btn-large ${localPlayer?.ready ? 'btn-secondary' : 'btn-accent'}`}
+                onClick={handleToggleReady}
+              >
+                {localPlayer?.ready ? 'Not Ready' : 'Ready!'}
+              </button>
+
+              {isHost && (
+                <button
+                  className="btn btn-primary btn-large"
+                  onClick={handleStartGame}
+                  disabled={!canStart}
+                >
+                  {canStart ? '🏁 Start Race' : 'Waiting for players...'}
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>

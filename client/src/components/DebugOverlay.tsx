@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { useGameStore } from '../store/gameStore';
 import { useNetworkStore } from '../store/networkStore';
 import { getReconciliationDebug, getPendingInputCount, getPredictedState } from '../game/clientPrediction';
 import './DebugOverlay.css';
+import { rendererFrameStats } from '../game/frameStats';
 
 interface DebugOverlayProps {
   localPlayerId: string | null;
@@ -11,7 +12,7 @@ interface DebugOverlayProps {
 function DebugOverlay({ localPlayerId }: DebugOverlayProps) {
   const [visible, setVisible] = useState(true);
   const [stats, setStats] = useState({
-    fps: 0,
+    ...rendererFrameStats.getStats(),
     correctionDist: 0,
     correctionX: 0,
     correctionY: 0,
@@ -32,12 +33,15 @@ function DebugOverlay({ localPlayerId }: DebugOverlayProps) {
     checkpoint: 0,
     finished: false,
     lapTimes: [] as number[],
+    wallContacts: 0,
+    wallCollisionSteps: 0,
+    carContacts: 0,
+    carCollisionSteps: 0,
   });
 
-  const frameCountRef = useRef(0);
-  const lastFpsTimeRef = useRef(performance.now());
   const lastServerCountRef = useRef(0);
   const lastServerHzTimeRef = useRef(performance.now());
+  const serverHzRef = useRef(0);
 
   // Toggle with B key
   useEffect(() => {
@@ -53,6 +57,10 @@ function DebugOverlay({ localPlayerId }: DebugOverlayProps) {
 
   // Update stats at ~10Hz
   useEffect(() => {
+    if (!visible) return;
+    lastServerCountRef.current = getReconciliationDebug().serverUpdateCount;
+    lastServerHzTimeRef.current = performance.now();
+    serverHzRef.current = 0;
     const interval = setInterval(() => {
       const debug = getReconciliationDebug();
       const predicted = getPredictedState();
@@ -61,30 +69,25 @@ function DebugOverlay({ localPlayerId }: DebugOverlayProps) {
         ? useGameStore.getState().cars.get(localPlayerId)
         : null;
 
-      // FPS calculation
-      frameCountRef.current++;
       const now = performance.now();
-      const fpsDelta = now - lastFpsTimeRef.current;
-
-      let fps = stats.fps;
-      if (fpsDelta >= 1000) {
-        fps = Math.round((frameCountRef.current / fpsDelta) * 1000);
-        frameCountRef.current = 0;
-        lastFpsTimeRef.current = now;
-      }
 
       // Server update Hz
       const hzDelta = now - lastServerHzTimeRef.current;
-      let serverHz = stats.serverHz;
-      if (hzDelta >= 2000) {
+      let serverHz = serverHzRef.current;
+      if (debug.serverUpdateCount < lastServerCountRef.current) {
+        lastServerCountRef.current = debug.serverUpdateCount;
+        lastServerHzTimeRef.current = now;
+        serverHzRef.current = serverHz = 0;
+      } else if (hzDelta >= 2000) {
         const newUpdates = debug.serverUpdateCount - lastServerCountRef.current;
         serverHz = Math.round((newUpdates / hzDelta) * 1000);
         lastServerCountRef.current = debug.serverUpdateCount;
         lastServerHzTimeRef.current = now;
+        serverHzRef.current = serverHz;
       }
 
       setStats({
-        fps,
+        ...rendererFrameStats.getStats(),
         correctionDist: debug.lastCorrectionDist,
         correctionX: debug.lastCorrectionX,
         correctionY: debug.lastCorrectionY,
@@ -105,28 +108,25 @@ function DebugOverlay({ localPlayerId }: DebugOverlayProps) {
         checkpoint: localCar?.checkpoint ?? 0,
         finished: localCar?.finished ?? false,
         lapTimes: localCar?.lapTimes ?? [],
+        wallContacts: debug.wallContacts,
+        wallCollisionSteps: debug.wallCollisionSteps,
+        carContacts: debug.carContacts,
+        carCollisionSteps: debug.carCollisionSteps,
       });
     }, 100);
 
     return () => clearInterval(interval);
-  }, [localPlayerId, stats.fps, stats.serverHz]);
-
-  // Also count render frames for FPS
-  useEffect(() => {
-    let animId: number;
-    const countFrame = () => {
-      frameCountRef.current++;
-      animId = requestAnimationFrame(countFrame);
-    };
-    animId = requestAnimationFrame(countFrame);
-    return () => cancelAnimationFrame(animId);
-  }, []);
+  }, [localPlayerId, visible]);
 
   if (!visible) return null;
 
   const correctionClass =
     stats.correctionDist > 20 ? 'error' :
     stats.correctionDist > 5 ? 'warn' : 'good';
+
+  const fpsClass =
+    stats.fps === null ? '' :
+    stats.fps < 30 ? 'error' : stats.fps < 50 ? 'warn' : 'good';
 
   const velDelta = Math.sqrt(stats.velDeltaX ** 2 + stats.velDeltaY ** 2);
   const velClass = velDelta > 2 ? 'error' : velDelta > 0.5 ? 'warn' : 'good';
@@ -140,6 +140,24 @@ function DebugOverlay({ localPlayerId }: DebugOverlayProps) {
   return (
     <div className="debug-overlay">
       <div className="debug-title">DEBUG (B to toggle)</div>
+
+      <div className="debug-section">
+        <div className="debug-section-title">Rendering</div>
+        <div className="debug-row">
+          <span className="debug-label">FPS</span>
+          <span className={`debug-value ${fpsClass}`}>
+            {stats.fps?.toFixed(1) ?? '--'}
+          </span>
+        </div>
+        <div className="debug-row">
+          <span className="debug-label">Frame time</span>
+          <span className="debug-value">{stats.frameTimeMs?.toFixed(1) ?? '--'} ms</span>
+        </div>
+        <div className="debug-row">
+          <span className="debug-label">Slowest frame</span>
+          <span className="debug-value">{stats.slowestFrameMs?.toFixed(1) ?? '--'} ms</span>
+        </div>
+      </div>
 
       {/* Reconciliation */}
       <div className="debug-section">
@@ -180,6 +198,26 @@ function DebugOverlay({ localPlayerId }: DebugOverlayProps) {
       </div>
 
       {/* Network */}
+      <div className="debug-section">
+        <div className="debug-section-title">Collisions</div>
+        <div className="debug-row">
+          <span className="debug-label">Wall contacts</span>
+          <span className="debug-value">{stats.wallContacts}</span>
+        </div>
+        <div className="debug-row">
+          <span className="debug-label">Wall contact steps</span>
+          <span className="debug-value">{stats.wallCollisionSteps}</span>
+        </div>
+        <div className="debug-row">
+          <span className="debug-label">Car contacts</span>
+          <span className="debug-value">{stats.carContacts}</span>
+        </div>
+        <div className="debug-row">
+          <span className="debug-label">Car contact steps</span>
+          <span className="debug-value">{stats.carCollisionSteps}</span>
+        </div>
+      </div>
+
       <div className="debug-section">
         <div className="debug-section-title">Network</div>
         <div className="debug-row">
@@ -251,4 +289,4 @@ function DebugOverlay({ localPlayerId }: DebugOverlayProps) {
   );
 }
 
-export default DebugOverlay;
+export default memo(DebugOverlay);

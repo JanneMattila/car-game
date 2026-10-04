@@ -14,6 +14,7 @@ import { TrackManager } from './tracks/trackManager.js';
 import { LeaderboardManager } from './leaderboards/leaderboardManager.js';
 import { StorageService } from './storage/storageService.js';
 import { createApiRoutes } from './routes/api.js';
+import { trackJsonParser, trackPayloadErrorHandler } from './routes/trackPayload.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -44,10 +45,12 @@ async function main() {
     origin: process.env['NODE_ENV'] === 'production' ? false : CLIENT_URL,
     credentials: true,
   }));
+  app.use('/api/tracks', trackJsonParser());
   app.use(express.json());
   
   // API routes
   app.use('/api', createApiRoutes(trackManager, leaderboardManager, roomManager));
+  app.use(trackPayloadErrorHandler);
   
   // Serve static files in production
   if (process.env['NODE_ENV'] === 'production') {

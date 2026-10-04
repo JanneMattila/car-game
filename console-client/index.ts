@@ -46,6 +46,11 @@ import {
   vec2Lerp,
   lerpAngle,
   vec2Distance,
+  getSteeringInput,
+  WallPredictionWorld,
+  stepNitro,
+  RoadSurfaceIndex,
+  drivingResistance,
 } from '../shared/index.js';
 
 // ── Client-side prediction ──────────────────────────────────────────
@@ -58,6 +63,8 @@ interface PredictedState {
   vx: number;
   vy: number;
   angularVelocity: number;
+  nitroAmount?: number;
+  layer?: number;
 }
 
 interface InputRecord {
@@ -82,19 +89,26 @@ let currentInput: InputRecord | null = null;
 const DELTA_TIME = 1 / 60;
 const MAX_PENDING_INPUTS = 120;
 let physicsAccumulator = 0;
+let wallWorld: WallPredictionWorld | null = null;
+let roadSurface: RoadSurfaceIndex | null = null;
 
 function vec2Len(x: number, y: number): number {
   return Math.sqrt(x * x + y * y);
 }
 
 // Server-matching constants for Verlet integration (mirrors clientPrediction.ts)
-const SERVER_BODY_MASS  = 1.2;           // density(0.002) × area(30×20)
+const SERVER_BODY_MASS  = PHYSICS_CONSTANTS.CAR_BODY_MASS;
 const MATTER_DT         = 1000 / 60;     // ms – same as baseDelta
 const MATTER_DT_SQUARED = MATTER_DT * MATTER_DT; // ≈ 277.78
 const MATTER_FRICTION_AIR = 1 - 0.01;    // 0.99 – body.frictionAir = 0.01
 
 function simulateStep(state: PredictedState, input: InputRecord): PredictedState {
   let { x, y, rotation, vx, vy, angularVelocity } = state;
+  const nitro = stepNitro(state.nitroAmount ?? PHYSICS_CONSTANTS.NITRO_MAX, input.nitro, DELTA_TIME);
+  const resistance = drivingResistance(
+    roadSurface ? roadSurface.isAsphalt({ x, y }, state.layer ?? 0) : true,
+    wallWorld?.forceScale ?? 1
+  );
 
   // Forward direction (same convention as server)
   const forwardX = Math.sin(rotation);
@@ -112,14 +126,14 @@ function simulateStep(state: PredictedState, input: InputRecord): PredictedState
 
   // Acceleration – server: applyForce( rotate((0, -ENGINE_FORCE*0.001), angle) )
   if (input.accelerate && speed < PHYSICS_CONSTANTS.MAX_SPEED) {
-    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001;
-    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001;
+    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001 * resistance.forceScale;
+    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001 * resistance.forceScale;
   }
 
   // Nitro boost – server: applyForce( rotate((0, -ENGINE_FORCE*0.0015), angle) )
-  if (input.nitro) {
-    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015;
-    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015;
+  if (nitro.boostScale > 0) {
+    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015 * nitro.boostScale * resistance.forceScale;
+    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015 * nitro.boostScale * resistance.forceScale;
   }
 
   // ── 2. Direct velocity modifications (setVelocity on server) ────
@@ -132,20 +146,13 @@ function simulateStep(state: PredictedState, input: InputRecord): PredictedState
       vy *= 0.95;
     } else if (speed < PHYSICS_CONSTANTS.MAX_REVERSE_SPEED) {
       // Server: reverse via applyForce
-      forceX -= forwardX * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001;
-      forceY -= forwardY * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001;
+      forceX -= forwardX * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001 * resistance.forceScale;
+      forceY -= forwardY * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001 * resistance.forceScale;
     }
   }
 
   // ── 3. Steering (angular velocity) ─────────────────────────────
-  let steerInput = 0;
-  if (input.steerValue !== undefined && input.steerValue !== 0) {
-    steerInput = input.steerValue;
-  } else if (input.steerLeft) {
-    steerInput = -1;
-  } else if (input.steerRight) {
-    steerInput = 1;
-  }
+  const steerInput = getSteeringInput(input);
 
   if (steerInput !== 0) {
     const minTurnSpeed = 0.5;
@@ -175,15 +182,15 @@ function simulateStep(state: PredictedState, input: InputRecord): PredictedState
 
   // ── 4. Drag (matches server: setVelocity *= (1 − drag·speed − rolling)) ─
   const dragForce = PHYSICS_CONSTANTS.DRAG_COEFFICIENT * speed;
-  const rollingResistance = PHYSICS_CONSTANTS.ROLLING_RESISTANCE;
+  const rollingResistance = resistance.rollingResistance;
   const dragFactor = 1 - dragForce - rollingResistance;
   vx *= dragFactor;
   vy *= dragFactor;
 
   // ── 5. Speed clamp (server uses pre-drag `speed` for comparison) ─
-  const maxSpeed = input.nitro
+  const maxSpeed = resistance.speedScale * (nitro.boostScale > 0
     ? PHYSICS_CONSTANTS.MAX_SPEED * PHYSICS_CONSTANTS.NITRO_BOOST_MULTIPLIER
-    : PHYSICS_CONSTANTS.MAX_SPEED;
+    : PHYSICS_CONSTANTS.MAX_SPEED);
   if (speed > maxSpeed) {
     const ratio = maxSpeed / speed;
     vx *= ratio;
@@ -204,7 +211,9 @@ function simulateStep(state: PredictedState, input: InputRecord): PredictedState
   y += vy;
 
   // Do NOT wrap — keep positions continuous for smooth camera/rendering.
-  return { x, y, rotation, vx, vy, angularVelocity };
+  const next = { x, y, rotation, vx, vy, angularVelocity };
+  const result = wallWorld ? wallWorld.resolve(state, next) : next;
+  return { ...result, nitroAmount: nitro.amount, layer: state.layer ?? 0 };
 }
 
 function recordInput(input: InputRecord): void {
@@ -226,16 +235,19 @@ function predictFrame(deltaTime: number = DELTA_TIME): PredictedState | null {
   // Render interpolation for sub-frame smoothness
   if (previousState && predictedState) {
     const alpha = physicsAccumulator / DELTA_TIME;
-    return {
+    const display = {
       x: previousState.x + (predictedState.x - previousState.x) * alpha,
       y: previousState.y + (predictedState.y - previousState.y) * alpha,
       rotation: previousState.rotation + (predictedState.rotation - previousState.rotation) * alpha,
       vx: predictedState.vx,
       vy: predictedState.vy,
       angularVelocity: predictedState.angularVelocity,
+      nitroAmount: predictedState.nitroAmount,
+      layer: predictedState.layer,
     };
+    return wallWorld?.constrain(display) ?? display;
   }
-  return predictedState;
+  return predictedState ? wallWorld?.constrain(predictedState) ?? predictedState : null;
 }
 
 function reconcileWithServer(serverState: PredictedState, serverSequence: number): PredictedState {
@@ -245,6 +257,10 @@ function reconcileWithServer(serverState: PredictedState, serverSequence: number
   lastConfirmedSequence = serverSequence;
 
   const target = serverState;
+  if (predictedState && target.layer !== undefined) predictedState.layer = target.layer;
+  if (predictedState && target.nitroAmount !== undefined) {
+    predictedState.nitroAmount = target.nitroAmount;
+  }
 
   if (!predictedState) {
     predictedState = { ...target, angularVelocity: target.angularVelocity ?? 0 };
@@ -280,6 +296,7 @@ function reconcileWithServer(serverState: PredictedState, serverSequence: number
   const BLEND_FACTOR   = 0.1; // 10% correction per server update (~20 Hz)
 
   if (dist > SNAP_THRESHOLD) {
+    wallWorld?.reset();
     // Large discrepancy – hard snap
     predictedState.x = target.x;
     predictedState.y = target.y;
@@ -299,6 +316,9 @@ function reconcileWithServer(serverState: PredictedState, serverSequence: number
 }
 
 function initializePrediction(state: PredictedState): void {
+  wallWorld?.dispose();
+  roadSurface = track ? new RoadSurfaceIndex(track) : null;
+  wallWorld = new WallPredictionWorld(track);
   predictedState = { ...state, angularVelocity: state.angularVelocity ?? 0 };
   previousState = null;
   pendingInputs.length = 0;
@@ -318,6 +338,9 @@ function initializePrediction(state: PredictedState): void {
 }
 
 function clearPrediction(): void {
+  wallWorld?.dispose();
+  roadSurface = null;
+  wallWorld = null;
   predictedState = null;
   previousState = null;
   pendingInputs.length = 0;
@@ -327,6 +350,7 @@ function clearPrediction(): void {
 }
 
 function resetPredictionVelocity(): void {
+  wallWorld?.reset();
   if (predictedState) {
     predictedState.vx = 0;
     predictedState.vy = 0;
@@ -520,7 +544,10 @@ function logRaceResults(results: RaceResult[]): void {
 // ── Game state update (mirrors gameStore.ts updateFromServer) ───────
 
 function updateFromServer(snapshot: GameStateSnapshot): void {
-
+  const activeIds = new Set(snapshot.cars.map(car => car.playerId));
+  for (const id of cars.keys()) {
+    if (!activeIds.has(id)) cars.delete(id);
+  }
   for (const carSnapshot of snapshot.cars) {
     const existingCar = cars.get(carSnapshot.playerId);
     const carState = deserializeCarState(carSnapshot, existingCar);
@@ -550,6 +577,8 @@ function updateFromServer(snapshot: GameStateSnapshot): void {
           vx: carState.velocity.x,
           vy: carState.velocity.y,
           angularVelocity: carState.angularVelocity ?? 0,
+          nitroAmount: carState.nitroAmount,
+          layer: carState.layer,
         },
         carSnapshot.lastInputSequence ?? snapshot.sequence
       );
@@ -609,20 +638,7 @@ function interpolate(deltaTime: number): void {
   const clampedDeltaTime = Math.min(deltaTime, 0.1);
 
   for (const [pid, car] of cars) {
-    // Local player: continuous prediction (mirrors gameStore.ts)
-    if (pid === playerId) {
-      const predicted = predictFrame(clampedDeltaTime);
-      if (predicted) {
-        stats.predictionFrames++;
-        cars.set(pid, {
-          ...car,
-          displayPosition: { x: predicted.x, y: predicted.y },
-          displayRotation: predicted.rotation,
-          velocity: { x: predicted.vx, y: predicted.vy },
-        });
-      }
-      continue;
-    }
+    if (pid === playerId) continue;
 
     // Remote players: lerp toward target (mirrors gameStore.ts)
     if (!Number.isFinite(car.displayPosition.x) || !Number.isFinite(car.displayPosition.y)) {
@@ -654,6 +670,22 @@ function interpolate(deltaTime: number): void {
       displayRotation: Number.isFinite(newDisplayRotation) ? newDisplayRotation : car.targetRotation,
     });
   }
+  wallWorld?.setOpponents([...cars.values()].filter(car => car.playerId !== playerId).map(car => ({
+    ...car, position: car.displayPosition, rotation: car.displayRotation,
+  })));
+  const localCar = playerId ? cars.get(playerId) : null;
+  if (localCar && playerId) {
+    const predicted = predictFrame(clampedDeltaTime);
+    if (predicted) {
+      stats.predictionFrames++;
+      cars.set(playerId, {
+        ...localCar,
+        displayPosition: { x: predicted.x, y: predicted.y },
+        displayRotation: predicted.rotation,
+        velocity: { x: predicted.vx, y: predicted.vy },
+      });
+    }
+  }
 }
 
 // ── Initialize cars (mirrors gameStore.ts initializeCars) ──────────
@@ -679,6 +711,8 @@ function initializeCars(carSnapshots: CarStateSnapshot[]): void {
         vx: carState.velocity.x,
         vy: carState.velocity.y,
         angularVelocity: carState.angularVelocity ?? 0,
+        nitroAmount: carState.nitroAmount,
+        layer: carState.layer,
       });
     }
   }
@@ -887,6 +921,7 @@ function handleMessage(message: ServerMessage): void {
       gamePhase = 'results';
       logRaceResults(message.results);
       stopGameLoops();
+      clearPrediction();
       break;
 
     case 'collision':
@@ -1169,6 +1204,7 @@ function shutdown(): void {
   logNet('Shutting down...');
 
   stopGameLoops();
+  clearPrediction();
   if (pingInterval) clearInterval(pingInterval);
 
   console.log('\n' + C.bright + '═══ Session Stats ═══' + C.reset);

@@ -10,7 +10,7 @@ import {
 } from '@shared';
 import { useNetworkStore } from './networkStore';
 import { vec2Lerp, lerpAngle, vec2Distance } from '@shared';
-import { reconcileWithServer, initializePrediction, clearPrediction, predictFrame } from '../game/clientPrediction';
+import { reconcileWithServer, initializePrediction, clearPrediction, predictFrame, setPredictionTrack, setPredictionOpponents } from '../game/clientPrediction';
 
 interface InterpolatedCar extends CarState {
   targetPosition: { x: number; y: number };
@@ -87,6 +87,7 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 
   updateFromServer: (snapshot) => {
+    setPredictionTrack(useNetworkStore.getState().track);
     const { cars: currentCars, localPlayerId, inputSequence } = get();
     const newCars = new Map<string, InterpolatedCar>();
 
@@ -120,6 +121,8 @@ export const useGameStore = create<GameState>((set, get) => ({
             vx: carState.velocity.x,
             vy: carState.velocity.y,
             angularVelocity: carState.angularVelocity ?? 0,
+            nitroAmount: carState.nitroAmount,
+            layer: carState.layer,
           },
           carSnapshot.lastInputSequence ?? snapshot.sequence
         );
@@ -209,22 +212,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     const clampedDeltaTime = Math.min(deltaTime, 0.1); // Max 100ms
 
     for (const [playerId, car] of cars) {
-      // For local player, run continuous prediction (only during racing)
-      if (playerId === localPlayerId) {
-        const room = useNetworkStore.getState().room;
-        const predicted = room?.state === 'racing' ? predictFrame(clampedDeltaTime) : null;
-        if (predicted) {
-          updatedCars.set(playerId, {
-            ...car,
-            displayPosition: { x: predicted.x, y: predicted.y },
-            displayRotation: predicted.rotation,
-            velocity: { x: predicted.vx, y: predicted.vy },
-          });
-        } else {
-          updatedCars.set(playerId, car);
-        }
-        continue;
-      }
+      if (playerId === localPlayerId) continue;
       
       // Validate existing values for remote players
       if (!Number.isFinite(car.displayPosition.x) || !Number.isFinite(car.displayPosition.y)) {
@@ -259,6 +247,21 @@ export const useGameStore = create<GameState>((set, get) => ({
       });
     }
 
+    setPredictionTrack(useNetworkStore.getState().track);
+    setPredictionOpponents([...updatedCars.values()].map(car => ({
+      ...car, position: car.displayPosition, rotation: car.displayRotation,
+    })));
+    const localCar = localPlayerId ? cars.get(localPlayerId) : null;
+    if (localCar && localPlayerId) {
+      const predicted = useNetworkStore.getState().room?.state === 'racing'
+        ? predictFrame(clampedDeltaTime) : null;
+      updatedCars.set(localPlayerId, predicted ? {
+        ...localCar,
+        displayPosition: { x: predicted.x, y: predicted.y },
+        displayRotation: predicted.rotation,
+        velocity: { x: predicted.vx, y: predicted.vy },
+      } : localCar);
+    }
     set({ cars: updatedCars });
   },
 
@@ -330,7 +333,9 @@ export const useGameStore = create<GameState>((set, get) => ({
           vx: carState.velocity.x,
           vy: carState.velocity.y,
           angularVelocity: carState.angularVelocity ?? 0,
-        });
+          nitroAmount: carState.nitroAmount,
+          layer: carState.layer,
+        }, useNetworkStore.getState().track);
       }
     }
     set({ cars: newCars });

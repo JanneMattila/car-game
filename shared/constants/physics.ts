@@ -13,6 +13,7 @@ export const PHYSICS_CONSTANTS = {
   CAR_INERTIA: 5000, // Higher inertia = more stable rotation, less twitchy
   CAR_WIDTH: 30,   // Matches visual sprite width
   CAR_HEIGHT: 50,  // Matches visual sprite height
+  CAR_BODY_MASS: 1.2, // Preserve handling when matching the rendered footprint
   WHEEL_BASE: 35,  // Scaled proportionally
   
   // Forces - TUNED FOR PX/FRAME UNITS (Matter.js native)
@@ -22,9 +23,14 @@ export const PHYSICS_CONSTANTS = {
   REVERSE_FORCE: 3.5,     // Moderate reverse
   DRAG_COEFFICIENT: 0.015, // Less air resistance for higher speeds
   ROLLING_RESISTANCE: 0.012, // Less coasting slowdown
+  OFFROAD_FORCE_MULTIPLIER: 0.8,
+  OFFROAD_SPEED_MULTIPLIER: 0.85,
+  OFFROAD_ROLLING_RESISTANCE: 0.03,
+  CONTACT_FORCE_MULTIPLIER: 0.4,
+  COLLISION_SPEED_RETENTION: 0.65,
   
   // Steering - balanced turning
-  MAX_STEERING_ANGLE: Math.PI / 10, // ~18 degrees - moderate turns
+  MAX_STEERING_ANGLE: (3 * Math.PI) / 40, // 13.5 degrees - gentler turns
   STEERING_SPEED: 3.0, // radians per second
   STEERING_RETURN_SPEED: 3,
   MAX_ANGULAR_VELOCITY: 2.0, // radians per second - balanced turning

@@ -16,6 +16,7 @@ import {
   GameSettings,
   Track,
   InputState,
+  DEFAULT_INPUT_STATE,
   PlayerInput,
 } from '@shared';
 
@@ -165,8 +166,13 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   },
 
   leaveRoom: () => {
+    const room = get().room;
+    if (room?.state === 'racing' || room?.state === 'countdown') {
+      get().sendInput({ ...DEFAULT_INPUT_STATE, sequenceNumber: Date.now() });
+    }
     get().send({ type: 'leave_room' });
     set({ room: null, players: [], gameState: null, results: [], track: null });
+    useGameStore.getState().reset();
   },
 
   setReady: (ready) => {
@@ -238,7 +244,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         break;
 
       case 'room_left':
-        set({ room: null, players: [], gameState: null, track: null });
+        set({ room: null, players: [], gameState: null, results: [], track: null });
+        useGameStore.getState().reset();
         break;
 
       case 'player_joined':
@@ -275,6 +282,10 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         break;
 
       case 'game_starting':
+        if (!get().room) {
+          debugLogger.log('GAME', 'Ignoring countdown after leaving the room');
+          break;
+        }
         debugLogger.log('GAME', 'game_starting received', { 
           hasRoom: !!get().room, 
           hasTrack: !!message.track, 
@@ -315,11 +326,19 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         break;
 
       case 'countdown':
+        if (!get().room) {
+          debugLogger.log('GAME', 'Ignoring countdown after leaving the room');
+          break;
+        }
         // Update countdown value (3, 2, 1, 0=GO!)
         useGameStore.getState().setCountdown(message.count);
         break;
 
       case 'game_started':
+        if (!get().room) {
+          debugLogger.log('GAME', 'Ignoring race start after leaving the room');
+          break;
+        }
         set(state => state.room ? {
           room: { ...state.room, state: 'racing' },
         } : {});
@@ -393,6 +412,10 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       }
 
       case 'game_state':
+        if (!get().room || get().room?.state === 'waiting') {
+          debugLogger.log('GAME', 'Ignoring game state without a started room');
+          break;
+        }
         set({ gameState: message.state });
         // Update cars in game store for interpolation
         if (message.state) {
@@ -443,6 +466,10 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         break;
 
       case 'race_finished':
+        if (!get().room) {
+          debugLogger.log('GAME', 'Ignoring results after leaving the room');
+          break;
+        }
         set(state => ({
           results: message.results,
           room: state.room ? { ...state.room, state: 'results' as const } : null,

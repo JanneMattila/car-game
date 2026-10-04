@@ -27,5 +27,35 @@ npm-debug.log*
 # Test coverage
 coverage/
 
-# Game data (optional - uncomment to track)
-data/
+# Keep player-generated data local; include the curated racing circuits.
+data/*
+!data/tracks/
+data/tracks/*
+!data/tracks/silverstone-grand-prix.json
+!data/tracks/monza-grand-prix.json
+!data/tracks/spa-francorchamps-grand-prix.json
+!data/tracks/interlagos-grand-prix.json
+!data/tracks/daytona-tri-oval.json
+!data/tracks/talladega-superspeedway.json
+!data/tracks/bristol-short-oval.json
+!data/tracks/pacific-city-circuit.json
+!data/tracks/melbourne-grand-prix.json
+!data/tracks/shanghai-grand-prix.json
+!data/tracks/suzuka-grand-prix.json
+!data/tracks/bahrain-grand-prix.json
+!data/tracks/jeddah-grand-prix.json
+!data/tracks/miami-grand-prix.json
+!data/tracks/montreal-grand-prix.json
+!data/tracks/monaco-grand-prix.json
+!data/tracks/barcelona-grand-prix.json
+!data/tracks/red-bull-ring-grand-prix.json
+!data/tracks/hungaroring-grand-prix.json
+!data/tracks/zandvoort-grand-prix.json
+!data/tracks/madrid-grand-prix.json
+!data/tracks/baku-grand-prix.json
+!data/tracks/singapore-grand-prix.json
+!data/tracks/austin-grand-prix.json
+!data/tracks/mexico-city-grand-prix.json
+!data/tracks/las-vegas-grand-prix.json
+!data/tracks/lusail-grand-prix.json
+!data/tracks/yas-marina-grand-prix.json

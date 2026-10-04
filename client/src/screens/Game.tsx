@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { useNavigate, useParams, useLocation } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useNetworkStore } from '../store/networkStore';
 import { useGameStore } from '../store/gameStore';
 import { useSettingsStore } from '../store/settingsStore';
 import GameRenderer from '../game/GameRenderer';
+import { useKeyboardInput } from '../game/InputHandler';
 import GameHUD from '../components/GameHUD';
 import GameOverlay from '../components/GameOverlay';
 import Countdown from '../components/Countdown';
@@ -11,34 +12,19 @@ import DebugOverlay from '../components/DebugOverlay';
 
 function Game() {
   const navigate = useNavigate();
-  const location = useLocation();
   const { roomId } = useParams();
   const containerRef = useRef<HTMLDivElement>(null);
   
-  const { room, localPlayerId } = useNetworkStore();
-  const { countdown, raceTimer, respawning } = useGameStore();
-  const { showMinimap, soundEnabled, musicEnabled } = useSettingsStore();
+  const room = useNetworkStore(state => state.room);
+  const localPlayerId = useNetworkStore(state => state.localPlayerId);
+  const countdown = useGameStore(state => state.countdown);
+  const raceTimer = useGameStore(state => state.raceTimer);
+  const respawning = useGameStore(state => state.respawning);
+  const showMinimap = useSettingsStore(state => state.showMinimap);
   
   const [isPaused, setIsPaused] = useState(false);
 
-  // Navigate to results when race ends
-  useEffect(() => {
-    if (room?.state === 'results') {
-      const target = `/results/${room.id}`;
-      if (location.pathname !== target) {
-        navigate(target);
-      }
-    }
-  }, [room?.state, room?.id, navigate, location.pathname]);
-
-  // Redirect if no room
-  useEffect(() => {
-    if (!room) {
-      if (location.pathname !== '/lobby') {
-        navigate('/lobby');
-      }
-    }
-  }, [room, navigate, location.pathname]);
+  useKeyboardInput();
 
   // Handle escape key for pause
   useEffect(() => {
@@ -51,7 +37,7 @@ function Game() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  if (!room) {
+  if (!room || room.id !== roomId) {
     return null;
   }
 
@@ -114,9 +100,7 @@ function Game() {
               <button 
                 className="btn btn-ghost"
                 onClick={() => {
-                  // Note: Browser back navigation doesn't work reliably in games
-                  // due to fullscreen mode and complex routing. Use direct navigation instead.
-                  navigate(`/room/${roomId}`);
+                  navigate(`/room/${roomId}`, { replace: true });
                 }}
               >
                 ← Back to Room
@@ -127,7 +111,7 @@ function Game() {
                   // Leave race and go to lobby
                   const { leaveRoom } = useNetworkStore.getState();
                   leaveRoom();
-                  navigate('/lobby');
+                  navigate('/lobby', { replace: true });
                 }}
               >
                 Leave Race

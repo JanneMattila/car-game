@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useNetworkStore } from '../store/networkStore';
 import { 
   Track, 
@@ -7,8 +7,26 @@ import {
   TrackElementType,
   DEFAULT_TRACK,
   CURRENT_TRACK_VERSION,
+  RoadBezier,
+  CurvePreset,
+  CURVE_PRESETS,
+  createBezierRoad,
+  getRoadBezier,
+  presetBezier,
+  nearestRoadEndpoint,
+  alignBezierEndpoint,
+  hitTestRoadCurve,
+  getRoadEndpoints,
+  roadStrokeWidth,
+  validateTrack,
+  fitRaceGate,
+  effectiveRaceGate,
+  preserveFinishMarkings,
 } from '@shared';
 import './TrackEditor.css';
+import { drawRoadCurve, drawScenery, drawFinishMarkings } from '../utils/trackDrawing';
+import CircuitTemplateDialog from './components/CircuitTemplateDialog';
+import { fitEditorViewport } from '../utils/editorViewport';
 
 interface Point {
   x: number;
@@ -36,8 +54,12 @@ const radToDeg = (rad: number) => (rad * 180) / Math.PI;
 
 function TrackEditor() {
   const navigate = useNavigate();
+  const { trackId } = useParams<{ trackId: string }>();
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const { trackList, requestTrackList, socket, connected } = useNetworkStore();
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const spaceHeld = useRef(false);
+  const dragHasHistory = useRef(false);
+  const { trackList, requestTrackList, connected } = useNetworkStore();
   
   const [track, setTrack] = useState<Track>({ ...DEFAULT_TRACK });
   const [selectedTool, setSelectedTool] = useState<TrackElementType>('select');
@@ -47,8 +69,20 @@ function TrackEditor() {
   const [drawPoints, setDrawPoints] = useState<Point[]>([]);
   const [gridSize, setGridSize] = useState(20);
   const [showGrid, setShowGrid] = useState(true);
+  const [showRaceMarkers, setShowRaceMarkers] = useState(true);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [viewport, setViewport] = useState({ width: 800, height: 600 });
+  const minimumZoom = fitEditorViewport(track.width, track.height, viewport).minimumZoom;
+  const [panDrag, setPanDrag] = useState<{ x: number; y: number; pan: Point } | null>(null);
+  const [curvePreset, setCurvePreset] = useState<CurvePreset>('right90');
+  const [roadWidth, setRoadWidth] = useState(160);
+  const [curveKerbs, setCurveKerbs] = useState(true);
+  const [snapEnabled, setSnapEnabled] = useState(true);
+  const [endpointSnap, setEndpointSnap] = useState(true);
+  const [curveDrag, setCurveDrag] = useState<{
+    id: string; handle: keyof RoadBezier; original: Track; curve: RoadBezier;
+  } | null>(null);
   const [currentLayer, setCurrentLayer] = useState(0); // Layer for new elements
   const [hideOtherLayers, setHideOtherLayers] = useState(false);
   const [autoExpandCanvas, setAutoExpandCanvas] = useState(false);
@@ -63,20 +97,23 @@ function TrackEditor() {
     originalSize?: { width: number; height: number };
     isDragging?: boolean;
   } | null>(null);
-  const [leftCollapsed, setLeftCollapsed] = useState(false);
-  const [rightCollapsed, setRightCollapsed] = useState(false);
+  const [leftCollapsed, setLeftCollapsed] = useState(window.innerWidth < 1000);
+  const [rightCollapsed, setRightCollapsed] = useState(window.innerWidth < 1300);
   const [leftWidth, setLeftWidth] = useState(280);
   const [rightWidth, setRightWidth] = useState(320);
   const [resizingPanel, setResizingPanel] = useState<null | { panel: 'left' | 'right'; startX: number; startWidth: number }>(null);
   const [showSelectedSection, setShowSelectedSection] = useState(true);
   const [showLoadDialog, setShowLoadDialog] = useState(false);
+  const [showTemplateDialog, setShowTemplateDialog] = useState(false);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [undoHistory, setUndoHistory] = useState<Track[]>([]);
+  const [redoHistory, setRedoHistory] = useState<Track[]>([]);
   const [pinnedTool, setPinnedTool] = useState<TrackElementType | null>(null);
 
   const toolHints: Record<TrackElementType, string> = {
     select: 'Select, move, and resize track elements',
     road: 'Straight road segment',
-    road_curve: 'Quarter-turn road; size snaps square for smooth arcs',
+    road_curve: 'Drag start to end; reshape with the four curve handles',
     wall: 'Barrier wall to block cars',
     checkpoint: 'Checkpoint that orders lap progress',
     finish: 'Finish line for race completion',
@@ -182,23 +219,28 @@ function TrackEditor() {
   };
 
   const hitTestElement = (point: Point, element: TrackElement): boolean => {
-    const rotation = element.rotation || 0;
-    const cx = element.x + element.width / 2;
-    const cy = element.y + element.height / 2;
+    if (element.type === 'road_curve') return hitTestRoadCurve(point, element, 4 / zoom);
+    const isRaceGate = element.type === 'finish' || element.type === 'checkpoint';
+    const shape = isRaceGate ? effectiveRaceGate(track, element) : element;
+    const tolerance = isRaceGate ? 4 / zoom : 0;
+    const rotation = shape.rotation || 0;
+    const cx = shape.x + shape.width / 2;
+    const cy = shape.y + shape.height / 2;
     const dx = point.x - cx;
     const dy = point.y - cy;
     
     // Use rectangular hit test for all elements including curves
     const cos = Math.cos(-rotation);
     const sin = Math.sin(-rotation);
-    const localX = dx * cos - dy * sin + element.width / 2;
-    const localY = dx * sin + dy * cos + element.height / 2;
-    return localX >= 0 && localX <= element.width && localY >= 0 && localY <= element.height;
+    const localX = dx * cos - dy * sin + shape.width / 2;
+    const localY = dx * sin + dy * cos + shape.height / 2;
+    return localX >= -tolerance && localX <= shape.width + tolerance &&
+      localY >= -tolerance && localY <= shape.height + tolerance;
   };
 
-  const hitResizeCorner = (point: Point, element: TrackElement, tolerance = 12): string | false => {
+  const hitResizeCorner = (point: Point, element: TrackElement, tolerance = 12 / zoom): string | false => {
     // Cars and spawn points cannot be resized
-    if (element.type === 'car' || element.type === 'spawn') return false;
+    if (element.type === 'car' || element.type === 'spawn' || element.properties?.bezier) return false;
     
     const rotation = element.rotation || 0;
     const cx = element.x + element.width / 2;
@@ -211,6 +253,8 @@ function TrackEditor() {
     const sin = Math.sin(-rotation);
     const localX = dx * cos - dy * sin + element.width / 2;
     const localY = dx * sin + dy * cos + element.height / 2;
+    if (localX < -tolerance || localY < -tolerance ||
+      localX > element.width + tolerance || localY > element.height + tolerance) return false;
     
     // Check each corner
     if (localX <= tolerance && localY <= tolerance) return 'top-left';
@@ -230,6 +274,7 @@ function TrackEditor() {
 
   // Add track state to undo history
   const addToHistory = useCallback(() => {
+    setRedoHistory([]);
     setUndoHistory(prev => {
       const newHistory = [...prev, track];
       return newHistory.slice(-50); // Keep last 50 states
@@ -241,10 +286,73 @@ function TrackEditor() {
     if (undoHistory.length === 0) return;
     
     const previousState = undoHistory[undoHistory.length - 1];
+    if (!previousState) return;
+    setRedoHistory(prev => [...prev, track]);
     setTrack(previousState);
     setUndoHistory(prev => prev.slice(0, -1));
     setSelectedElement(null);
-  }, [undoHistory]);
+    setSelectedElements([]);
+  }, [undoHistory, track]);
+
+  const handleRedo = useCallback(() => {
+    const next = redoHistory[redoHistory.length - 1];
+    if (!next) return;
+    setUndoHistory(prev => [...prev, track].slice(-50));
+    setTrack(next);
+    setRedoHistory(prev => prev.slice(0, -1));
+    setSelectedElement(null);
+    setSelectedElements([]);
+  }, [redoHistory, track]);
+
+  const fitTrack = useCallback(() => {
+    const fitted = fitEditorViewport(track.width, track.height, viewport);
+    setZoom(fitted.zoom);
+    setPan(fitted.pan);
+  }, [track.width, track.height, viewport]);
+
+  useEffect(() => {
+    const element = viewportRef.current;
+    if (!element) return;
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry) setViewport({
+        width: Math.max(1, Math.floor(entry.contentRect.width)),
+        height: Math.max(1, Math.floor(entry.contentRect.height)),
+      });
+      element.scrollLeft = 0;
+      element.scrollTop = 0;
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const onResize = () => {
+      if (window.innerWidth < 1000) setLeftCollapsed(true);
+      if (window.innerWidth < 1300) setRightCollapsed(true);
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  useEffect(() => {
+    fitTrack();
+  }, [track.id, viewport.width, viewport.height]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const nextZoom = Math.max(minimumZoom, Math.min(3, zoom * Math.exp(-e.deltaY * 0.001)));
+      setPan({ x: x - (x - pan.x) * nextZoom / zoom, y: y - (y - pan.y) * nextZoom / zoom });
+      setZoom(nextZoom);
+    };
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', onWheel);
+  }, [zoom, pan, minimumZoom]);
 
   // Handle tool selection with automatic pin removal
   const handleToolSelect = useCallback((toolType: TrackElementType) => {
@@ -253,39 +361,65 @@ function TrackEditor() {
       setPinnedTool(null);
     }
     setSelectedTool(toolType);
+    setIsDrawing(false);
+    setDrawPoints([]);
   }, [pinnedTool]);
 
   // Handle keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Ctrl+Z for undo
-      if (e.ctrlKey && e.key === 'z' && !e.shiftKey) {
+      const target = e.target;
+      if (target instanceof HTMLElement &&
+        (target.matches('input, textarea, select') || target.isContentEditable)) return;
+      if (e.code === 'Space') {
         e.preventDefault();
-        handleUndo();
+        spaceHeld.current = true;
+        return;
+      }
+      // Ctrl+Z for undo
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) handleRedo();
+        else handleUndo();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+        e.preventDefault();
+        handleRedo();
         return;
       }
       
       // Number keys for tool selection (1-9, then 0 for tool 10)
       if (e.key >= '1' && e.key <= '9') {
         const toolIndex = parseInt(e.key) - 1;
-        if (toolIndex < ELEMENT_TYPES.length) {
-          handleToolSelect(ELEMENT_TYPES[toolIndex].type);
+        const tool = ELEMENT_TYPES[toolIndex];
+        if (tool) {
+          handleToolSelect(tool.type);
         }
         return;
       }
       if (e.key === '0') {
         const toolIndex = 9; // 0 key = 10th tool (index 9)
-        if (toolIndex < ELEMENT_TYPES.length) {
-          handleToolSelect(ELEMENT_TYPES[toolIndex].type);
+        const tool = ELEMENT_TYPES[toolIndex];
+        if (tool) {
+          handleToolSelect(tool.type);
         }
         return;
       }
       
       if (e.key === 'Delete' && selectedElement) {
         handleDeleteElement();
+      } else if (e.key === 'Escape' && curveDrag) {
+        setTrack(curveDrag.original);
+        setCurveDrag(null);
+      } else if (e.key === 'Escape' && isDrawing) {
+        setIsDrawing(false);
+        setDrawPoints([]);
+      } else if (e.key.toLowerCase() === 'f') {
+        fitTrack();
       } else if (e.key === 'Escape' && dragState && dragState.mode === 'resize' && dragState.originalSize) {
         // Cancel resize and restore original size
-        updateElement(dragState.elementIds[0], cur => ({
+        updateElement(dragState.elementIds[0]!, cur => ({
           ...cur,
           width: dragState.originalSize!.width,
           height: dragState.originalSize!.height
@@ -295,8 +429,16 @@ function TrackEditor() {
     };
 
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedElement, dragState, handleUndo, handleToolSelect]);
+    const releaseSpace = () => { spaceHeld.current = false; };
+    const onKeyUp = (e: KeyboardEvent) => { if (e.code === 'Space') releaseSpace(); };
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', releaseSpace);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', releaseSpace);
+    };
+  }, [selectedElement, dragState, curveDrag, isDrawing, handleUndo, handleRedo, handleToolSelect, fitTrack]);
 
   // Draw canvas
   useEffect(() => {
@@ -313,24 +455,35 @@ function TrackEditor() {
     ctx.save();
     ctx.translate(pan.x, pan.y);
     ctx.scale(zoom, zoom);
+    ctx.fillStyle = track.backgroundColor ?? '#222238';
+    ctx.fillRect(0, 0, track.width, track.height);
 
     // Draw grid
     if (showGrid) {
       ctx.strokeStyle = '#2a2a4e';
       ctx.lineWidth = 0.5;
-      for (let x = 0; x < track.width; x += gridSize) {
+      const visibleGrid = gridSize * Math.max(1, Math.ceil(8 / (gridSize * zoom)));
+      const minX = Math.max(0, Math.floor(-pan.x / zoom / visibleGrid) * visibleGrid);
+      const minY = Math.max(0, Math.floor(-pan.y / zoom / visibleGrid) * visibleGrid);
+      const maxX = Math.min(track.width, (canvas.width - pan.x) / zoom);
+      const maxY = Math.min(track.height, (canvas.height - pan.y) / zoom);
+      for (let x = minX; x < maxX; x += visibleGrid) {
         ctx.beginPath();
         ctx.moveTo(x, 0);
         ctx.lineTo(x, track.height);
         ctx.stroke();
       }
-      for (let y = 0; y < track.height; y += gridSize) {
+      for (let y = minY; y < maxY; y += visibleGrid) {
         ctx.beginPath();
         ctx.moveTo(0, y);
         ctx.lineTo(track.width, y);
         ctx.stroke();
       }
     }
+    ctx.strokeStyle = '#8994a5';
+    ctx.lineWidth = 1 / zoom;
+    ctx.strokeRect(0, 0, track.width, track.height);
+    (track.scenery ?? []).forEach(item => drawScenery(ctx, item));
 
     const drawRect = (
       element: TrackElement,
@@ -371,29 +524,15 @@ function TrackEditor() {
       ctx.restore();
     };
 
-    const drawCurveRoad = (element: TrackElement, isSelected: boolean) => {
-      const rotation = element.rotation || 0;
-      const cx = element.x + element.width / 2;
-      const cy = element.y + element.height / 2;
-      const radius = Math.min(element.width, element.height) / 2;
-      ctx.save();
-      ctx.translate(cx, cy);
-      if (rotation) ctx.rotate(rotation);
-      ctx.strokeStyle = isSelected ? '#5a5a7e' : '#3a3a5e';
-      ctx.lineWidth = Math.min(element.width, element.height) * 0.6;
-      ctx.beginPath();
-      // Quarter circle that uses the full bounding box area
-      ctx.arc(-radius, -radius, radius, 0, Math.PI / 2);
-      ctx.stroke();
-      ctx.restore();
-    };
-
     // Draw elements (respect layer filter)
-    const elementsToDraw = hideOtherLayers
-      ? track.elements.filter(el => (el.layer ?? 0) === currentLayer)
-      : track.elements;
+    const elementsToDraw = track.elements.filter(el =>
+      (!hideOtherLayers || (el.layer ?? 0) === currentLayer) &&
+      (showRaceMarkers || (el.type !== 'checkpoint' && el.type !== 'spawn')));
+    elementsToDraw.filter(el => el.type === 'road_curve').forEach(element =>
+      drawRoadCurve(ctx, element, false, 'base'));
 
-    elementsToDraw.forEach((element) => {
+    elementsToDraw.forEach((original) => {
+      const element = effectiveRaceGate(track, original);
       const isSelected = element.id === selectedElement;
       const isMultiSelected = selectedElements.includes(element.id);
       const rotation = element.rotation || 0;
@@ -405,8 +544,9 @@ function TrackEditor() {
           drawRect(element, isSelected ? '#4a4a6e' : '#3a3a5e');
           break;
         case 'road_curve':
-          drawCurveRoad(element, isSelected);
+          drawRoadCurve(ctx, element, isSelected, 'surface');
           break;
+        case 'barrier':
         case 'wall':
           drawRect(element, isSelected ? '#8b0000' : '#4a0000');
           break;
@@ -441,19 +581,18 @@ function TrackEditor() {
           break;
         }
         case 'finish': {
-          const squareSize = 10;
-          ctx.save();
-          ctx.translate(cx, cy);
-          if (rotation) ctx.rotate(rotation);
-          ctx.translate(-element.width / 2, -element.height / 2);
-          for (let i = 0; i < element.width; i += squareSize) {
-            for (let j = 0; j < element.height; j += squareSize) {
-              ctx.fillStyle = (Math.floor(i / squareSize) + Math.floor(j / squareSize)) % 2 === 0 
-                ? 'white' : 'black';
-              ctx.fillRect(i, j, squareSize, squareSize);
-            }
+          drawFinishMarkings(ctx, track, original);
+          if (showRaceMarkers) {
+            ctx.save();
+            ctx.translate(cx, cy);
+            ctx.rotate(rotation);
+            ctx.strokeStyle = '#00d9ff';
+            ctx.lineWidth = 1.5 / zoom;
+            ctx.setLineDash([5 / zoom, 4 / zoom]);
+            ctx.strokeRect(-element.width / 2, -element.height / 2, element.width, element.height);
+            ctx.restore();
+            drawArrow(element, '#00d9ff');
           }
-          ctx.restore();
           break;
         }
         case 'boost':
@@ -557,18 +696,18 @@ function TrackEditor() {
         }
         
         // Draw resize handles for elements that can be resized (not cars or spawns)
-        if (element.type !== 'car' && element.type !== 'spawn') {
+        if (element.type !== 'car' && element.type !== 'spawn' && !element.properties?.bezier) {
           ctx.setLineDash([]);
           ctx.fillStyle = '#ffffff';
           ctx.strokeStyle = '#00ff00';
           ctx.lineWidth = 1;
           
-          const handleSize = 8;
+          const handleSize = 8 / zoom;
           const halfWidth = element.width / 2;
           const halfHeight = element.height / 2;
           
           // Draw corner resize handles
-          const corners = [
+          const corners: [number, number][] = [
             [-halfWidth, -halfHeight], // top-left
             [halfWidth, -halfHeight],  // top-right
             [-halfWidth, halfHeight],  // bottom-left
@@ -609,8 +748,55 @@ function TrackEditor() {
       }
     });
 
+    const selectedCurveElement = track.elements.find(el => el.id === selectedElement);
+    const selectedCurve = selectedCurveElement && getRoadBezier(selectedCurveElement);
+    if (selectedCurve) {
+      ctx.save();
+      ctx.strokeStyle = '#6de8ff';
+      ctx.lineWidth = 1.5 / zoom;
+      ctx.setLineDash([5 / zoom, 4 / zoom]);
+      ctx.beginPath();
+      ctx.moveTo(selectedCurve.start.x, selectedCurve.start.y);
+      ctx.lineTo(selectedCurve.control1.x, selectedCurve.control1.y);
+      ctx.moveTo(selectedCurve.end.x, selectedCurve.end.y);
+      ctx.lineTo(selectedCurve.control2.x, selectedCurve.control2.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      for (const [key, p] of Object.entries(selectedCurve)) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 6 / zoom, 0, Math.PI * 2);
+        ctx.fillStyle = key === 'start' || key === 'end' ? '#f9d65c' : '#6de8ff';
+        ctx.fill();
+        ctx.strokeStyle = '#182738';
+        ctx.stroke();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `${12 / zoom}px sans-serif`;
+        ctx.fillText(key === 'control1' ? 'Handle 1' : key === 'control2' ? 'Handle 2' : key, p.x + 10 / zoom, p.y - 10 / zoom);
+      }
+      ctx.restore();
+    }
+    if (selectedTool === 'road_curve' && endpointSnap) {
+      ctx.save();
+      ctx.fillStyle = '#f9d65c';
+      for (const el of elementsToDraw) {
+        for (const endpoint of getRoadEndpoints(el)) {
+          ctx.beginPath();
+          ctx.arc(endpoint.point.x, endpoint.point.y, 3 / zoom, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      ctx.restore();
+    }
+
     // Draw current drawing
     if (isDrawing && drawPoints.length > 0) {
+      if (selectedTool === 'road_curve' && drawPoints.length >= 2) {
+        const preview = makeCurve(drawPoints[0]!, drawPoints[drawPoints.length - 1]!);
+        ctx.save();
+        ctx.globalAlpha = 0.8;
+        drawRoadCurve(ctx, preview, true);
+        ctx.restore();
+      } else {
       ctx.strokeStyle = '#00ff00';
       ctx.lineWidth = 2;
       ctx.setLineDash([5, 5]);
@@ -626,13 +812,14 @@ function TrackEditor() {
         );
       }
       ctx.setLineDash([]);
+      }
     }
 
     ctx.restore();
-  }, [track, selectedElement, selectedElements, showGrid, gridSize, zoom, pan, isDrawing, drawPoints]);
+  }, [track, selectedElement, selectedElements, showGrid, showRaceMarkers, gridSize, zoom, pan, isDrawing, drawPoints, hideOtherLayers, currentLayer, viewport, selectedTool, curvePreset, roadWidth, curveKerbs, endpointSnap]);
 
   const snapToGrid = (value: number): number => {
-    return Math.round(value / gridSize) * gridSize;
+    return snapEnabled ? Math.round(value / gridSize) * gridSize : value;
   };
 
   // Panel resizing handlers
@@ -641,9 +828,9 @@ function TrackEditor() {
       if (!resizingPanel) return;
       const delta = e.clientX - resizingPanel.startX;
       if (resizingPanel.panel === 'left') {
-        setLeftWidth(prev => Math.max(200, Math.min(420, resizingPanel.startWidth + delta)));
+        setLeftWidth(Math.max(200, Math.min(420, resizingPanel.startWidth + delta)));
       } else {
-        setRightWidth(prev => Math.max(200, Math.min(420, resizingPanel.startWidth - delta)));
+        setRightWidth(Math.max(200, Math.min(420, resizingPanel.startWidth - delta)));
       }
     };
     const handleUp = () => setResizingPanel(null);
@@ -661,17 +848,53 @@ function TrackEditor() {
     
     const rect = canvas.getBoundingClientRect();
     return {
-      x: snapToGrid((e.clientX - rect.left - pan.x) / zoom),
-      y: snapToGrid((e.clientY - rect.top - pan.y) / zoom),
+      x: (e.clientX - rect.left - pan.x) / zoom,
+      y: (e.clientY - rect.top - pan.y) / zoom,
     };
   };
 
+  const snapCurveEndpoint = (point: Point, excludeId?: string) => endpointSnap
+    ? nearestRoadEndpoint(point, track.elements.filter(el => (el.layer ?? 0) === currentLayer), Math.min(80, 18 / zoom), excludeId)
+    : null;
+
+  const makeCurve = (start: Point, end: Point): TrackElement => {
+    let curve = presetBezier(start, end, curvePreset);
+    const startSnap = snapCurveEndpoint(start);
+    const endSnap = snapCurveEndpoint(end);
+    if (startSnap) curve = alignBezierEndpoint(curve, startSnap, true);
+    if (endSnap) curve = alignBezierEndpoint(curve, endSnap, false);
+    return createBezierRoad(`element-${Date.now()}`, curve, roadWidth, currentLayer, curveKerbs);
+  };
+
+  const reshapeCurve = (element: TrackElement, curve: RoadBezier, width = roadStrokeWidth(element)) => {
+    const updated = createBezierRoad(element.id, curve, width, element.layer ?? 0, element.properties?.kerbs ?? false);
+    updateElement(element.id, () => ({ ...element, ...updated, properties: { ...element.properties, ...updated.properties } }));
+  };
+
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (e.button === 1 || (e.button === 0 && spaceHeld.current)) {
+      e.preventDefault();
+      setPanDrag({ x: e.clientX, y: e.clientY, pan });
+      return;
+    }
+    if (e.button !== 0) return;
     const point = getCanvasPoint(e);
     const isCtrlClick = e.ctrlKey;
     
-    // Add current state to undo history before any changes
-    addToHistory();
+    dragHasHistory.current = false;
+
+    if (selectedTool === 'select' && selectedElement) {
+      const element = track.elements.find(el => el.id === selectedElement);
+      const curve = element && getRoadBezier(element);
+      if (element && curve) {
+        for (const key of ['start', 'control1', 'control2', 'end'] as const) {
+          if (Math.hypot(point.x - curve[key].x, point.y - curve[key].y) < 10 / zoom) {
+            setCurveDrag({ id: element.id, handle: key, original: track, curve });
+            return;
+          }
+        }
+      }
+    }
     
     // First check if clicking on resize handles of currently selected element
     if (selectedElement && selectedTool === 'select') {
@@ -699,8 +922,10 @@ function TrackEditor() {
     }
     
     // Check for selection first (top-most element) - but only allow drag/resize with select tool
-    for (let i = track.elements.length - 1; i >= 0; i--) {
+    for (let i = selectedTool === 'select' ? track.elements.length - 1 : -1; i >= 0; i--) {
       const el = track.elements[i]!;
+      if (hideOtherLayers && (el.layer ?? 0) !== currentLayer) continue;
+      if (!showRaceMarkers && (el.type === 'checkpoint' || el.type === 'spawn')) continue;
       if (hitTestElement(point, el)) {
         
         // Handle multi-select with Ctrl+click
@@ -711,7 +936,7 @@ function TrackEditor() {
             if (selectedElement === el.id) {
               // If removing the last selected element, set to the previous one or null
               const remaining = selectedElements.filter(id => id !== el.id);
-              setSelectedElement(remaining.length > 0 ? remaining[remaining.length - 1] : null);
+              setSelectedElement(remaining[remaining.length - 1] ?? null);
             }
           } else {
             // Add to multi-selection
@@ -752,6 +977,7 @@ function TrackEditor() {
     
     // Special case for car and spawn tools - place immediately with fixed size
     if (selectedTool === 'car' || selectedTool === 'spawn') {
+      addToHistory();
       const x = snapToGrid(point.x - 15); // Center on the click
       const y = snapToGrid(point.y - 25);
       
@@ -797,11 +1023,42 @@ function TrackEditor() {
     setSelectedElements([]);
     
     setIsDrawing(true);
-    setDrawPoints([point]);
+    const endpoint = selectedTool === 'road_curve' ? snapCurveEndpoint(point) : null;
+    setDrawPoints([endpoint?.point ?? { x: snapToGrid(point.x), y: snapToGrid(point.y) }]);
   };
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const point = getCanvasPoint(e);
+    if (panDrag) {
+      setPan({ x: panDrag.pan.x + e.clientX - panDrag.x, y: panDrag.pan.y + e.clientY - panDrag.y });
+      return;
+    }
+    if (curveDrag) {
+      if (!dragHasHistory.current) {
+        addToHistory();
+        dragHasHistory.current = true;
+      }
+      const element = track.elements.find(el => el.id === curveDrag.id);
+      if (!element) return;
+      const key = curveDrag.handle;
+      const curve = { ...curveDrag.curve };
+      const p = e.altKey ? point : { x: snapToGrid(point.x), y: snapToGrid(point.y) };
+      curve[key] = p;
+      if (key === 'start' || key === 'end') {
+        const control = key === 'start' ? 'control1' : 'control2';
+        curve[control] = {
+          x: curveDrag.curve[control].x + p.x - curveDrag.curve[key].x,
+          y: curveDrag.curve[control].y + p.y - curveDrag.curve[key].y,
+        };
+        const endpoint = e.altKey ? null : nearestRoadEndpoint(point,
+          track.elements.filter(el => (el.layer ?? 0) === (element.layer ?? 0)),
+          Math.min(80, 18 / zoom), element.id);
+        reshapeCurve(element, endpointSnap && endpoint ? alignBezierEndpoint(curve, endpoint, key === 'start') : curve);
+      } else {
+        reshapeCurve(element, curve);
+      }
+      return;
+    }
     
     // Update cursor for resize detection when not dragging
     if (!dragState && selectedTool === 'select' && selectedElement) {
@@ -839,9 +1096,13 @@ function TrackEditor() {
     }
 
     if (dragState && dragState.isDragging) {
+      if (!dragHasHistory.current) {
+        addToHistory();
+        dragHasHistory.current = true;
+      }
       if (dragState.mode === 'resize' && dragState.elementIds.length === 1) {
         // Handle resizing for single element
-        const elementId = dragState.elementIds[0];
+        const elementId = dragState.elementIds[0]!;
         const element = track.elements.find(el => el.id === elementId);
         if (element && dragState.corner && dragState.originalSize) {
           const rotation = element.rotation || 0;
@@ -878,7 +1139,7 @@ function TrackEditor() {
           }
           
           // For curves, maintain square aspect ratio after calculating dimensions
-          if (element.type === 'road_curve') {
+          if (element.type === 'road_curve' && !element.properties?.bezier) {
             const size = Math.max(newWidth, newHeight);
             newWidth = size;
             newHeight = size;
@@ -900,12 +1161,12 @@ function TrackEditor() {
             const sin = Math.sin(rotation);
             const worldOffsetX = localOffsetX * cos - localOffsetY * sin;
             const worldOffsetY = localOffsetX * sin + localOffsetY * cos;
-            newX = dragState.elementStartPositions[0].x + worldOffsetX;
-            newY = dragState.elementStartPositions[0].y + worldOffsetY;
+            newX = dragState.elementStartPositions[0]!.x + worldOffsetX;
+            newY = dragState.elementStartPositions[0]!.y + worldOffsetY;
           } else if (localOffsetX !== 0 || localOffsetY !== 0) {
             // No rotation, simple offset
-            newX = dragState.elementStartPositions[0].x + localOffsetX;
-            newY = dragState.elementStartPositions[0].y + localOffsetY;
+            newX = dragState.elementStartPositions[0]!.x + localOffsetX;
+            newY = dragState.elementStartPositions[0]!.y + localOffsetY;
           }
           
           updateElement(elementId, cur => ({
@@ -934,7 +1195,7 @@ function TrackEditor() {
         
       } else if (dragState.elementIds.length === 1) {
         // Single element drag
-        const elementId = dragState.elementIds[0];
+        const elementId = dragState.elementIds[0]!;
         const deltaX = point.x - dragState.startPoint.x;
         const deltaY = point.y - dragState.startPoint.y;
         
@@ -950,20 +1211,24 @@ function TrackEditor() {
 
     if (!isDrawing || !drawPoints[0]) return;
     if (selectedTool === 'road_curve') {
-      const start = drawPoints[0];
-      const size = Math.max(Math.abs(point.x - start.x), Math.abs(point.y - start.y));
-      const snapSize = snapToGrid(size);
-      const snappedEnd = {
-        x: start.x + Math.sign(point.x - start.x) * snapSize,
-        y: start.y + Math.sign(point.y - start.y) * snapSize,
-      };
-      setDrawPoints([start, snappedEnd]);
+      const endpoint = snapCurveEndpoint(point);
+      setDrawPoints([drawPoints[0], endpoint?.point ?? { x: snapToGrid(point.x), y: snapToGrid(point.y) }]);
     } else {
       setDrawPoints([drawPoints[0], point]);
     }
   };
 
   const handleMouseUp = () => {
+    if (panDrag) {
+      setPanDrag(null);
+      return;
+    }
+    if (curveDrag) {
+      const element = track.elements.find(el => el.id === curveDrag.id);
+      if (element) expandCanvasIfNeeded(element);
+      setCurveDrag(null);
+      return;
+    }
     // Reset cursor
     const canvas = canvasRef.current;
     if (canvas) {
@@ -993,17 +1258,28 @@ function TrackEditor() {
         setDrawPoints([]);
         return;
       }
+      if (selectedTool === 'road_curve') {
+        if (Math.hypot(end.x - start.x, end.y - start.y) >= 20) {
+          addToHistory();
+          const newElement = makeCurve(start, end);
+          setTrack(prev => ({ ...prev, elements: [...prev.elements, newElement] }));
+          setSelectedElement(newElement.id);
+          setSelectedElements([]);
+          expandCanvasIfNeeded(newElement);
+          if (!pinnedTool) setSelectedTool('select');
+        }
+        setIsDrawing(false);
+        setDrawPoints([]);
+        return;
+      }
       
       const x = Math.min(start.x, end.x);
       const y = Math.min(start.y, end.y);
       const rawWidth = Math.abs(end.x - start.x) || gridSize;
       const rawHeight = Math.abs(end.y - start.y) || gridSize;
-      const squareSize = Math.max(rawWidth, rawHeight);
       let width, height;
       
-      if (selectedTool === 'road_curve') {
-        width = height = squareSize;
-      } else if (selectedTool === 'car') {
+      if (selectedTool === 'car') {
         // Car uses preset dimensions from physics constants
         width = 30; // CAR_WIDTH
         height = 50; // CAR_HEIGHT
@@ -1030,7 +1306,11 @@ function TrackEditor() {
         height,
         rotation: 0,
         layer: elementLayer,
+        ...(selectedTool === 'finish' ? {
+          properties: { finishVisibleWidth: width, finishVisibleOffset: 0 },
+        } : {}),
       };
+      addToHistory();
 
       if (selectedTool === 'checkpoint') {
         newElement.checkpointIndex = track.elements.filter(e => e.type === 'checkpoint').length;
@@ -1076,6 +1356,7 @@ function TrackEditor() {
     if (!selectedElement) return;
     const element = track.elements.find(e => e.id === selectedElement);
     if (!element) return;
+    addToHistory();
     
     // Create a copy with new ID and offset position
     const duplicatedElement = {
@@ -1097,12 +1378,21 @@ function TrackEditor() {
   };
 
   const handleSaveTrack = async () => {
+    setSaveNotice(null);
+    useNetworkStore.getState().clearError();
     try {
       // Filter out car elements since they're just visual references
       const trackToSave = {
         ...track,
         elements: track.elements.filter(e => e.type !== 'car')
       };
+      const validation = validateTrack(trackToSave);
+      if (!validation.isValid) {
+        useNetworkStore.setState({
+          error: `Cannot save track: ${validation.errors.map(error => error.message).join('; ')}`,
+        });
+        return;
+      }
       
       const response = await fetch('/api/tracks', {
         method: 'POST',
@@ -1111,20 +1401,25 @@ function TrackEditor() {
       });
       
       if (response.ok) {
-        alert('Track saved successfully!');
+        setSaveNotice('Track saved successfully.');
         requestTrackList();
       } else {
         const data = await response.json();
-        const errorMessages = data.errors?.map((e: { message: string }) => e.message).join('\n') || 'Unknown error';
-        alert(`Failed to save track:\n${errorMessages}`);
+        const errorMessages = data.errors?.map((e: { message: string }) => e.message).join('; ')
+          || data.error || `HTTP ${response.status}`;
+        console.error('Failed to save track:', response.status, errorMessages);
+        useNetworkStore.setState({ error: `Failed to save track: ${errorMessages}` });
       }
     } catch (error) {
       console.error('Error saving track:', error);
-      alert('Error saving track');
+      useNetworkStore.setState({
+        error: 'Unable to save track. Check the server connection and try Save again.',
+      });
     }
   };
 
   const handleLoadTrack = async (trackId: string) => {
+    useNetworkStore.getState().clearError();
     console.log('Loading track:', trackId);
     try {
       const response = await fetch(`/api/tracks/${trackId}`);
@@ -1133,18 +1428,31 @@ function TrackEditor() {
         const trackData = await response.json();
         console.log('Loaded track data:', trackData.name, trackData.elements?.length, 'elements');
         setTrack(trackData);
+        setSaveNotice(null);
         setSelectedElement(null);
+        setSelectedElements([]);
+        setUndoHistory([]);
+        setRedoHistory([]);
       } else {
         console.error('Failed to load track, status:', response.status);
         const errorText = await response.text();
         console.error('Error response:', errorText);
+        useNetworkStore.setState({
+          error: response.status === 404
+            ? 'Track not found. Please choose another track from Load.'
+            : `Unable to load track (HTTP ${response.status}). The server may be restarting; please try Load again.`,
+        });
       }
     } catch (error) {
       console.error('Failed to load track:', error);
+      useNetworkStore.setState({
+        error: 'Unable to load track. Check the server connection and try Load again.',
+      });
     }
   };
 
   const handleNewTrack = () => {
+    setSaveNotice(null);
     setTrack({
       ...DEFAULT_TRACK,
       id: `track-${Date.now()}`,
@@ -1153,6 +1461,28 @@ function TrackEditor() {
       updatedAt: Date.now(),
     });
     setSelectedElement(null);
+    setSelectedElements([]);
+    setUndoHistory([]);
+    setRedoHistory([]);
+  };
+
+  const handleCreateTemplate = (copy: Track) => {
+    setSaveNotice(null);
+    addToHistory();
+    setTrack(copy);
+    setSelectedElement(null);
+    setSelectedElements([]);
+    setSelectedTool('select');
+    setPinnedTool(null);
+    setIsDrawing(false);
+    setDrawPoints([]);
+    setCurveDrag(null);
+    setDragState(null);
+    setCurrentLayer(0);
+    const road = copy.elements.find(e => e.type === 'road_curve')!.properties!;
+    setRoadWidth(road.roadWidth!);
+    setCurveKerbs(road.kerbs ?? true);
+    setShowTemplateDialog(false);
   };
 
   const handleDeleteCurrentTrack = async () => {
@@ -1178,7 +1508,7 @@ function TrackEditor() {
     }
   };
 
-  const handleDeleteTrack = async (trackId: string, trackName: string) => {
+  const handleDeleteTrack = async (trackId: string, _trackName: string) => {
     if (!confirm('Delete selected track?')) {
       return;
     }
@@ -1242,6 +1572,11 @@ function TrackEditor() {
           alert(`Cannot import track: version ${fileVersion} is not supported. Maximum supported version is ${CURRENT_TRACK_VERSION}.`);
           return;
         }
+        const validation = validateTrack(trackData);
+        if (!validation.isValid) {
+          alert(`Cannot import track:\n${validation.errors.map(error => error.message).join('\n')}`);
+          return;
+        }
         // Assign a new ID, version, and timestamps so it's treated as a new track
         trackData.id = `track-${Date.now()}`;
         trackData.version = CURRENT_TRACK_VERSION;
@@ -1250,6 +1585,8 @@ function TrackEditor() {
         setTrack(trackData);
         setSelectedElement(null);
         setSelectedElements([]);
+        setUndoHistory([]);
+        setRedoHistory([]);
       } catch (error) {
         console.error('Failed to import track:', error);
         alert('Failed to import track. Make sure the file is a valid track JSON.');
@@ -1275,9 +1612,13 @@ function TrackEditor() {
           createdAt: Date.now(),
           updatedAt: Date.now(),
         };
+
         console.log('Created copy with new ID:', newTrack.id);
         setTrack(newTrack);
         setSelectedElement(null);
+        setSelectedElements([]);
+        setUndoHistory([]);
+        setRedoHistory([]);
       } else {
         console.error('Failed to fetch track for copy, status:', response.status);
         const errorText = await response.text();
@@ -1289,6 +1630,10 @@ function TrackEditor() {
       alert('Failed to copy track');
     }
   };
+
+  useEffect(() => {
+    if (trackId) void handleLoadTrack(trackId);
+  }, [trackId]);
 
   return (
     <div className="screen track-editor">
@@ -1303,11 +1648,19 @@ function TrackEditor() {
             onClick={handleUndo}
             disabled={undoHistory.length === 0}
             title="Undo (Ctrl+Z)"
+            aria-label="Undo"
           >
             ↶
           </button>
+          <button className="btn btn-secondary" onClick={handleRedo}
+            disabled={redoHistory.length === 0} title="Redo (Ctrl+Shift+Z)" aria-label="Redo">
+            Redo
+          </button>
           <button className="btn btn-secondary" onClick={handleNewTrack}>
             New
+          </button>
+          <button className="btn btn-secondary" onClick={() => setShowTemplateDialog(true)}>
+            Templates
           </button>
           <button className="btn btn-secondary" onClick={() => setShowLoadDialog(true)}>
             Load
@@ -1323,6 +1676,12 @@ function TrackEditor() {
           </button>
         </div>
       </header>
+
+      {saveNotice && <div className="editor-save-notice" role="status">
+        <span>{saveNotice}</span>
+        <button className="btn btn-ghost btn-small" onClick={() => setSaveNotice(null)}
+          aria-label="Dismiss save notification">Dismiss</button>
+      </div>}
 
       <div
         className="editor-layout"
@@ -1373,6 +1732,32 @@ function TrackEditor() {
               );
             })}
           </div>
+
+          {selectedTool === 'road_curve' && (
+            <section className="curve-preset-section">
+              <h4>Curve studio</h4>
+              <div className="curve-preset-grid">
+                {CURVE_PRESETS.map(preset => (
+                  <button key={preset.id}
+                    className={`preset-btn ${curvePreset === preset.id ? 'active' : ''}`}
+                    onClick={() => setCurvePreset(preset.id)}
+                    aria-pressed={curvePreset === preset.id}>
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+              <label className="curve-field">
+                Road width
+                <input className="input" type="number" min={40} max={600} step={10}
+                  value={roadWidth} onChange={e => setRoadWidth(Math.max(40, Math.min(600, Number(e.target.value))))} />
+              </label>
+              <label className="checkbox-label">
+                <input type="checkbox" checked={curveKerbs} onChange={e => setCurveKerbs(e.target.checked)} />
+                Red / white kerbs
+              </label>
+              <p className="preset-hint">Drag from the road entry to its exit. Yellow dots snap to road ends and match their direction. Select the curve to drag its blue handles.</p>
+            </section>
+          )}
 
           <h3>Track Settings</h3>
           <div className="track-settings">
@@ -1446,6 +1831,23 @@ function TrackEditor() {
           <h3>View Options</h3>
           <div className="view-options">
             <label className="checkbox-label">
+              <input type="checkbox" checked={showRaceMarkers} onChange={e => setShowRaceMarkers(e.target.checked)} />
+              Show race markers
+            </label>
+            <label className="curve-field">
+              Grid spacing
+              <input className="input" type="number" min={5} max={100} step={5}
+                value={gridSize} onChange={e => setGridSize(Math.max(5, Math.min(100, Number(e.target.value))))} />
+            </label>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={snapEnabled} onChange={e => setSnapEnabled(e.target.checked)} />
+              Snap to grid
+            </label>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={endpointSnap} onChange={e => setEndpointSnap(e.target.checked)} />
+              Snap curve endpoints
+            </label>
+            <label className="checkbox-label">
               <input
                 type="checkbox"
                 checked={showGrid}
@@ -1473,11 +1875,18 @@ function TrackEditor() {
               <label>Zoom</label>
               <input
                 type="range"
-                min="0.5"
-                max="2"
-                step="0.1"
+                min={minimumZoom}
+                max="3"
+                step="0.01"
                 value={zoom}
-                onChange={(e) => setZoom(Number(e.target.value))}
+                onChange={(e) => {
+                  const nextZoom = Number(e.target.value);
+                  setPan({
+                    x: viewport.width / 2 - (viewport.width / 2 - pan.x) * nextZoom / zoom,
+                    y: viewport.height / 2 - (viewport.height / 2 - pan.y) * nextZoom / zoom,
+                  });
+                  setZoom(nextZoom);
+                }}
               />
             </div>
           </div>
@@ -1488,22 +1897,36 @@ function TrackEditor() {
           />
         </aside>
         ) : (
-          <div className="collapsed-tab" onClick={() => setLeftCollapsed(false)} title="Expand">
+          <div className="collapsed-tab" onClick={() => {
+            setLeftCollapsed(false);
+            if (window.innerWidth < 1000) setRightCollapsed(true);
+          }} title="Expand tools" role="button" tabIndex={0} onKeyDown={e => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              setLeftCollapsed(false);
+              if (window.innerWidth < 1000) setRightCollapsed(true);
+            }
+          }}>
             »
           </div>
         )}
 
         {/* Canvas */}
-        <main className="canvas-container">
+        <main className="canvas-container" ref={viewportRef}>
           <canvas
             ref={canvasRef}
-            width={track.width}
-            height={track.height}
+            width={viewport.width}
+            height={viewport.height}
+            aria-label="Track editing canvas"
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
             onMouseLeave={handleMouseUp}
           />
+          <div className="canvas-navigation">
+            <button className="btn btn-secondary btn-small" onClick={fitTrack}>Fit track (F)</button>
+            <span>{Math.round(zoom * 100)}%</span>
+            <span>Scroll to zoom · Space + drag to pan</span>
+          </div>
         </main>
 
         {/* Properties Panel */}
@@ -1538,8 +1961,8 @@ function TrackEditor() {
                 }, Object.keys(elements[0] || {}));
                 
                 // Get common values for properties
-                const getCommonValue = (prop: string) => {
-                  const values = elements.map(e => e[prop as keyof TrackElement]);
+                const getCommonValue = (prop: 'layer') => {
+                  const values = elements.map(e => e[prop]);
                   const firstValue = values[0];
                   const allSame = values.every(v => v === firstValue);
                   return allSame ? firstValue : '';
@@ -1682,9 +2105,153 @@ function TrackEditor() {
             const el = track.elements.find(e => e.id === selectedElement);
             if (!el) return null;
             return (
-              <div className="element-properties">
+              <div className="element-properties" onFocus={e => {
+                if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) addToHistory();
+              }}>
                 <p>Type: {el.type}</p>
-                <p className="hint">Tip: Drag element to move. Drag bottom-right square to resize.</p>
+                <p className="hint">{el.properties?.bezier
+                  ? 'Yellow handles move the endpoints; blue handles shape the bend. Hold Alt for unsnapped precision.'
+                  : 'Tip: Drag element to move. Drag bottom-right square to resize.'}</p>
+                {(el.type === 'finish' || el.type === 'checkpoint') && (
+                  <section className="curve-inspector">
+                    <h3>Race gate</h3>
+                    <p className="hint">
+                      Cross in the arrow direction. Gates detect swept movement, not proximity.
+                      Span the entire corridor, including grass, to prevent missed laps.
+                    </p>
+                    <label className="checkbox-label">
+                      <input type="checkbox" checked={el.properties?.autoGateWidth !== false}
+                        onChange={e => {
+                          addToHistory();
+                          updateElement(el.id, cur => ({
+                            ...cur, properties: { ...cur.properties, autoGateWidth: e.target.checked },
+                          }));
+                        }} />
+                      Automatically span nearby barriers
+                    </label>
+                    <p>Detection width (including hidden parts): {Math.round(effectiveRaceGate(track, el).width)}</p>
+                    {el.type === 'finish' && (
+                      <>
+                        <p className="hint">
+                          The dashed cyan span counts laps even on grass. Checkerboard markings
+                          are always clipped to asphalt on this layer. Width 0 hides all markings.
+                        </p>
+                        <label className="curve-field">
+                          Visible marking width
+                          <input className="input" type="number" min={0}
+                            value={el.properties?.finishVisibleWidth ?? el.width}
+                            onFocus={addToHistory}
+                            onChange={e => updateElement(el.id, cur => ({
+                              ...cur, properties: {
+                                ...cur.properties,
+                                finishVisibleWidth: Math.max(0, Number(e.target.value)),
+                              },
+                            }))} />
+                        </label>
+                        <label className="curve-field">
+                          Visible marking offset
+                          <input className="input" type="number"
+                            value={el.properties?.finishVisibleOffset ?? 0}
+                            onFocus={addToHistory}
+                            onChange={e => updateElement(el.id, cur => ({
+                              ...cur, properties: {
+                                ...cur.properties, finishVisibleOffset: Number(e.target.value),
+                              },
+                            }))} />
+                        </label>
+                      </>
+                    )}
+                    {fitRaceGate(track, el) === el && (
+                      <p className="hint">No nearby barrier pair. Set a manual width covering all drivable ground.</p>
+                    )}
+                    <button className="btn btn-secondary" disabled={fitRaceGate(track, el) === el} onClick={() => {
+                      addToHistory();
+                      const fitted = preserveFinishMarkings(el, fitRaceGate(track, el));
+                      updateElement(el.id, () => ({
+                        ...fitted, properties: { ...fitted.properties, autoGateWidth: false },
+                      }));
+                    }}>Fit width to barriers</button>
+                  </section>
+                )}
+                {el.type === 'road_curve' && (
+                  <section className="curve-inspector">
+                    <h3>Curve shape</h3>
+                    <label className="curve-field">
+                      Road width
+                      <input className="input" type="number" min={20} max={600}
+                        value={Math.round(roadStrokeWidth(el))}
+                        onChange={e => {
+                          const width = Math.max(20, Math.min(600, Number(e.target.value)));
+                          const curve = getRoadBezier(el);
+                          if (curve) reshapeCurve(el, curve, width);
+                          else updateElement(el.id, cur => ({ ...cur, properties: { ...cur.properties, roadWidth: width } }));
+                        }} />
+                    </label>
+                    <label className="checkbox-label">
+                      <input type="checkbox" checked={el.properties?.kerbs ?? false}
+                        onChange={e => updateElement(el.id, cur => ({
+                          ...cur, properties: { ...cur.properties, kerbs: e.target.checked },
+                        }))} />
+                      Red / white kerbs
+                    </label>
+                    {!el.properties?.bezier && (
+                      <button className="btn btn-secondary" onClick={() => {
+                        const ends = getRoadEndpoints(el);
+                        const start = ends[0];
+                        const end = ends[1];
+                        if (!start || !end) return;
+                        addToHistory();
+                        reshapeCurve(el, {
+                          start: start.point, end: end.point,
+                          control1: { x: start.point.x - start.outward.x * el.width * 0.276142, y: start.point.y - start.outward.y * el.width * 0.276142 },
+                          control2: { x: end.point.x - end.outward.x * el.width * 0.276142, y: end.point.y - end.outward.y * el.width * 0.276142 },
+                        });
+                      }}>Convert to editable curve</button>
+                    )}
+                    {el.properties?.bezier && (
+                      <>
+                        <div className="button-row">
+                          <button className="btn btn-secondary btn-small" onClick={() => {
+                            const curve = getRoadBezier(el);
+                            if (!curve) return;
+                            addToHistory();
+                            reshapeCurve(el, presetBezier(curve.start, curve.end, 'custom'));
+                          }}>Straighten</button>
+                          <button className="btn btn-secondary btn-small" onClick={() => {
+                            const curve = getRoadBezier(el);
+                            if (!curve) return;
+                            addToHistory();
+                            reshapeCurve(el, { start: curve.end, control1: curve.control2, control2: curve.control1, end: curve.start });
+                          }}>Reverse ends</button>
+                        </div>
+                        <p className="hint">Precise world coordinates</p>
+                        {(['start', 'control1', 'control2', 'end'] as const).map(key => {
+                          const curve = getRoadBezier(el);
+                          if (!curve) return null;
+                          return (
+                            <div className="curve-coordinate" key={key}>
+                              <span>{key === 'control1' ? 'Handle 1' : key === 'control2' ? 'Handle 2' : key}</span>
+                              {(['x', 'y'] as const).map(axis => (
+                                <label key={axis}>{axis.toUpperCase()}
+                                  <input className="input" type="number" step={1}
+                                    value={Math.round(curve[key][axis])}
+                                    onChange={e => {
+                                      const next = { ...curve, [key]: { ...curve[key], [axis]: Number(e.target.value) } };
+                                      if (key === 'start' || key === 'end') {
+                                        const control = key === 'start' ? 'control1' : 'control2';
+                                        next[control] = { ...curve[control], [axis]: curve[control][axis] + next[key][axis] - curve[key][axis] };
+                                      }
+                                      reshapeCurve(el, next);
+                                    }} />
+                                </label>
+                              ))}
+                            </div>
+                          );
+                        })}
+                      </>
+                    )}
+                  </section>
+                )}
                 <div className="form-grid">
                   <label>
                     X
@@ -1839,12 +2406,23 @@ function TrackEditor() {
           />
         </aside>
         ) : (
-          <div className="collapsed-tab right" onClick={() => setRightCollapsed(false)} title="Expand">
+          <div className="collapsed-tab right" onClick={() => {
+            setRightCollapsed(false);
+            if (window.innerWidth < 1000) setLeftCollapsed(true);
+          }} title="Expand properties" role="button" tabIndex={0} onKeyDown={e => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              setRightCollapsed(false);
+              if (window.innerWidth < 1000) setLeftCollapsed(true);
+            }
+          }}>
             «
           </div>
         )}      </div>
 
       {/* Load Track Dialog */}
+      {showTemplateDialog && <CircuitTemplateDialog onCreate={handleCreateTemplate}
+        onClose={() => setShowTemplateDialog(false)} />}
+
       {showLoadDialog && (
         <div className="dialog-overlay" onClick={() => setShowLoadDialog(false)}>
           <div className="dialog" onClick={(e) => e.stopPropagation()}>

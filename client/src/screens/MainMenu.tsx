@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { useSettingsStore } from '../store/settingsStore';
 import { useNetworkStore } from '../store/networkStore';
 import { COLOR_ORDER, CAR_COLORS, validateNickname } from '@shared';
@@ -7,22 +7,11 @@ import './MainMenu.css';
 
 function MainMenu() {
   const navigate = useNavigate();
-  const location = useLocation();
   const { nickname, preferredColor, setNickname, setPreferredColor } = useSettingsStore();
-  const { connected, createRoom, joinRoom, room, trackList, requestTrackList } = useNetworkStore();
+  const { connected, createRoom, joinRoom, trackList, requestTrackList } = useNetworkStore();
   const [joinCode, setJoinCode] = useState('');
   const [error, setError] = useState('');
   const [showSettings, setShowSettings] = useState(!validateNickname(nickname).valid);
-
-  // Navigate as soon as a room is joined (quick play or manual join)
-  useEffect(() => {
-    if (room) {
-      const target = `/room/${room.id}`;
-      if (location.pathname !== target) {
-        navigate(target);
-      }
-    }
-  }, [room, navigate, location.pathname]);
 
   // Refresh tracks so quick play can pick from available options
   useEffect(() => {
