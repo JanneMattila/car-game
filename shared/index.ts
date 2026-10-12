@@ -25,4 +25,5 @@ export * from './utils/raceGates';
 export * from './utils/finishMarkings';
 export * from './utils/sceneryGeometry';
 export * from './utils/circuitBuilder';
+export * from './utils/startGrid';
 export * from './tracks/circuitTemplates';

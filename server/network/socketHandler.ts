@@ -10,6 +10,8 @@ import {
   Track,
   CarStateSnapshot,
   RoomPlayer,
+  BotDifficulty,
+  BOT_DIFFICULTIES,
 } from '@shared';
 import { validateNickname, sanitizeChatMessage, isValidRoomCode } from '@shared';
 import { RoomManager } from '../game/roomManager.js';
@@ -98,6 +100,14 @@ export class SocketHandler {
 
       case 'start_game':
         this.handleStartGame(socket, socketData);
+        break;
+
+      case 'add_bot':
+        this.handleAddBot(socket, socketData, msg.difficulty);
+        break;
+
+      case 'remove_bot':
+        this.handleRemoveBot(socket, socketData, msg.playerId);
         break;
 
       case 'input':
@@ -281,6 +291,52 @@ export class SocketHandler {
     if (!room.startGame()) {
       this.send(socket, { type: 'error', code: 'CANNOT_START', message: 'Cannot start game' });
     }
+  }
+
+  private getHostedRoom(socket: Socket, socketData: SocketData): GameRoom | null {
+    const room = this.roomManager.getPlayerRoom(socketData.playerId);
+    if (!room) return null;
+    if (room.getHostId() !== socketData.playerId) {
+      this.send(socket, {
+        type: 'error',
+        code: 'NOT_HOST',
+        message: 'Only the host can manage AI players',
+      });
+      return null;
+    }
+    return room;
+  }
+
+  private handleAddBot(socket: Socket, socketData: SocketData, difficulty: unknown): void {
+    const room = this.getHostedRoom(socket, socketData);
+    if (!room) return;
+    const level = BOT_DIFFICULTIES.includes(difficulty as BotDifficulty)
+      ? difficulty as BotDifficulty
+      : 'medium';
+    const bot = room.addBot(level);
+    if (!bot) {
+      this.send(socket, {
+        type: 'error',
+        code: 'ADD_BOT_FAILED',
+        message: room.isFull() ? 'Room is full' : 'AI players can only be added between races',
+      });
+      return;
+    }
+    this.broadcast(room.getId(), { type: 'player_joined', player: room.toRoomPlayer(bot) });
+  }
+
+  private handleRemoveBot(socket: Socket, socketData: SocketData, playerId: string): void {
+    const room = this.getHostedRoom(socket, socketData);
+    if (!room) return;
+    if (room.getState() !== 'waiting' && room.getState() !== 'results') {
+      this.send(socket, {
+        type: 'error',
+        code: 'REMOVE_BOT_FAILED',
+        message: 'AI players can only be removed between races',
+      });
+      return;
+    }
+    room.removeBot(playerId);
   }
 
   private handleInput(socket: Socket, socketData: SocketData, input: unknown): void {

@@ -2,7 +2,7 @@
 
 import { CarState } from './car';
 import { GameState, GameSettings, RaceResult } from './game';
-import { Player, PlayerInput, CarColor } from './player';
+import { Player, PlayerInput, CarColor, BotDifficulty } from './player';
 import { RoomInfo, RoomListItem, RoomPlayer } from './room';
 import { TrackMetadata, Track } from './track';
 
@@ -13,6 +13,8 @@ export type ClientMessage =
   | { type: 'leave_room' }
   | { type: 'set_ready'; ready: boolean }
   | { type: 'start_game' }
+  | { type: 'add_bot'; difficulty: BotDifficulty }
+  | { type: 'remove_bot'; playerId: string }
   | { type: 'input'; input: PlayerInput }
   | { type: 'chat'; message: string }
   | { type: 'emote'; emote: EmoteType }

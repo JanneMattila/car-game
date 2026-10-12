@@ -5,6 +5,7 @@ A multiplayer browser-based racing game built with React, Node.js, Socket.IO, an
 ## ✨ Features
 
 - **Real-time Multiplayer**: Up to 8 players per race with WebSocket communication
+- **AI Opponents**: The room host can fill empty seats with Easy, Medium or Hard AI drivers that race with full collisions
 - **Custom Track Editor**: Visual track designer with drag-and-drop elements
 - **Circuit Templates**: Editable F1-inspired road courses and NASCAR-inspired speedways, with previews and coordinated road-width, grid and barrier generation
 - **Original City Circuit**: Pacific City combines downtown, beachfront, hillside bends, canals, an airport and a container harbor
@@ -237,6 +238,24 @@ new countdown automatically.
 - When validating movement, hold **ArrowUp** across track boundaries and repeat
   after **Play Again** and leaving/rejoining. Normal driving should not trigger
   large backward jumps or `[SNAP]` corrections in the **B** debug overlay.
+
+### Start Grid and AI Players
+
+- Cars line up in join order from pole position backwards. Spawn points are
+  ordered by how far ahead they are along the finish line's direction, not by
+  their order in the track file. When more cars race than a track has spawn
+  points, the grid continues in further rows behind the authored ones, so cars
+  never start overlapping.
+- AI players are server-side and always ready. They drive through the same
+  physics as humans, so collisions with cars and barriers apply to them too.
+  They do not post leaderboard times and never keep an empty room alive. A
+  human joining a full room between races takes the newest AI player's seat.
+- Each track gets a racing line on first use: A* routes through every gate in
+  order over a wall-clearance grid, then the line is relaxed through corners
+  and given a speed profile. It is built in slices so other rooms keep racing.
+- Drivers follow the line, brake for corners, pass slower cars when there is
+  room, reverse out of contacts, and are placed back on the line after a missed
+  gate or a long stall.
 
 ### Two-player Console Testing
 
@@ -491,7 +510,7 @@ NODE_ENV=production
 1. Open the application in your browser
 2. Enter your player name
 3. Create a room or join an existing room with a room code
-4. Wait for other players to join
+4. Wait for other players to join, or as host choose a difficulty and select **🤖 Add AI** to add computer opponents (remove them with **✕**)
 5. Host can start the countdown when ready
 
 ### 2. Racing Controls

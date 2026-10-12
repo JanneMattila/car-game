@@ -84,6 +84,34 @@
   font-weight: 700;
 }
 
+.bot-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border: 1px solid var(--color-accent);
+  color: var(--color-accent);
+  border-radius: var(--radius-sm);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.add-bot-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.add-bot-row label,
+.add-bot-row .btn {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.bot-difficulty-select {
+  width: auto;
+}
+
 .ready-status {
   font-size: 12px;
   color: var(--color-text-muted);
@@ -101,6 +129,10 @@
 
 .player-slot:hover .kick-btn {
   opacity: 1;
+}
+
+.player-slot .bot-remove-btn {
+  opacity: 0.6;
 }
 
 .room-info-section {

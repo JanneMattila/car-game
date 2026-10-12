@@ -2,6 +2,7 @@
 
 import { GameSettings, GameState, RaceResult } from './game';
 import { Player } from './player';
+import type { BotDifficulty } from './player';
 import { CarState } from './car';
 
 export interface Room {
@@ -50,6 +51,8 @@ export interface RoomPlayer {
   finished: boolean;
   finishTime: number | null;
   bestLapTime: number | null;
+  isBot?: boolean;
+  botDifficulty?: BotDifficulty;
 }
 
 export interface RoomListItem {

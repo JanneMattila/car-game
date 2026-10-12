@@ -13,14 +13,23 @@ import {
   RaceResult,
   GameStateSnapshot,
   GameEvent,
+  BotDifficulty,
+  RoomPlayer,
   createInitialCarState,
   serializeCarState,
   GAME_CONSTANTS,
   PHYSICS_CONSTANTS,
 } from '@shared';
-import { generateUUID, getAvailableColor, unwrapForTrack } from '@shared';
+import { computeStartGrid, generateUUID, getAvailableColor, unwrapForTrack } from '@shared';
 import { PhysicsEngine } from './physicsEngine.js';
 import { LeaderboardManager } from '../leaderboards/leaderboardManager.js';
+import { BotDriver } from './botDriver.js';
+import { RacingLine, prepareRacingLine } from './racingLine.js';
+
+const BOT_NAMES = [
+  'Turbo Bot', 'Apex Bot', 'Nitro Bot', 'Drift Bot',
+  'Redline Bot', 'Chicane Bot', 'Piston Bot', 'Slipstream Bot',
+];
 
 type RoomEventListener = (event: string, data: unknown) => void;
 
@@ -51,6 +60,10 @@ export class GameRoom {
   private eventListeners: RoomEventListener[] = [];
   private pendingEvents: GameEvent[] = [];
   private stateSequence: number = 0;
+
+  private botDrivers: Map<string, BotDriver> = new Map();
+  private racingLine: RacingLine | null = null;
+  private racingLineRequested = false;
 
   constructor(
     id: string,
@@ -126,8 +139,20 @@ export class GameRoom {
     return this.players.size >= this.settings.maxPlayers;
   }
 
+  /** A human may take a bot's seat while the room is between races. */
+  canSeatHuman(): boolean {
+    if (!this.isFull()) return true;
+    const betweenRaces = this.state === 'waiting' || this.state === 'results';
+    return betweenRaces && Array.from(this.players.values()).some(player => player.isBot);
+  }
+
+  /** Bots never keep a room alive on their own. */
   isEmpty(): boolean {
-    return this.players.size === 0;
+    return this.getHumanPlayers().length === 0;
+  }
+
+  private getHumanPlayers(): Player[] {
+    return Array.from(this.players.values()).filter(player => !player.isBot);
   }
 
   getIdleTime(now: number): number {
@@ -162,24 +187,27 @@ export class GameRoom {
       state: this.state,
       isPrivate: this.settings.isPrivate,
       lapCount: this.settings.lapCount,
-      players: Array.from(this.players.values()).map(p => {
-        const car = this.cars.get(p.id);
-        return {
-          id: p.id,
-          nickname: p.nickname,
-          color: p.color,
-          ready: p.isReady,
-          isHost: p.id === this.hostId,
-          position: car ? { x: car.position.x, y: car.position.y } : null,
-          angle: car?.rotation ?? 0,
-          velocity: car ? { x: car.velocity.x, y: car.velocity.y } : null,
-          lap: car?.lap ?? 0,
-          checkpointIndex: car?.checkpoint ?? 0,
-          finished: car?.finished ?? false,
-          finishTime: car?.finishTime ?? null,
-          bestLapTime: null, // Will be tracked separately
-        };
-      }),
+      players: Array.from(this.players.values()).map(p => this.toRoomPlayer(p)),
+    };
+  }
+
+  toRoomPlayer(p: Player): RoomPlayer {
+    const car = this.cars.get(p.id);
+    return {
+      id: p.id,
+      nickname: p.nickname,
+      color: p.color,
+      ready: p.isReady,
+      isHost: p.id === this.hostId,
+      position: car ? { x: car.position.x, y: car.position.y } : null,
+      angle: car?.rotation ?? 0,
+      velocity: car ? { x: car.velocity.x, y: car.velocity.y } : null,
+      lap: car?.lap ?? 0,
+      checkpointIndex: car?.checkpoint ?? 0,
+      finished: car?.finished ?? false,
+      finishTime: car?.finishTime ?? null,
+      bestLapTime: null, // Will be tracked separately
+      ...(p.isBot ? { isBot: true, botDifficulty: p.botDifficulty } : {}),
     };
   }
 
@@ -187,6 +215,12 @@ export class GameRoom {
   addPlayer(playerId: string, nickname: string, preferredColor: CarColor): Player | null {
     if (this.players.has(playerId)) {
       return this.players.get(playerId)!;
+    }
+
+    // A human may take a bot's seat while the room is between races.
+    if (this.isFull() && this.canSeatHuman()) {
+      const bot = Array.from(this.players.values()).reverse().find(player => player.isBot);
+      if (bot) this.removePlayer(bot.id);
     }
 
     if (this.isFull()) {
@@ -220,24 +254,53 @@ export class GameRoom {
     }
 
     // Emit player in RoomPlayer format
-    const car = this.cars.get(playerId);
-    this.emit('player_joined', {
-      id: player.id,
-      nickname: player.nickname,
-      color: player.color,
-      ready: player.isReady,
-      isHost: player.id === this.hostId,
-      position: car ? { x: car.position.x, y: car.position.y } : null,
-      angle: car?.rotation ?? 0,
-      velocity: car ? { x: car.velocity.x, y: car.velocity.y } : null,
-      lap: car?.lap ?? 0,
-      checkpointIndex: car?.checkpoint ?? 0,
-      finished: car?.finished ?? false,
-      finishTime: car?.finishTime ?? null,
-      bestLapTime: null,
-    });
+    this.emit('player_joined', this.toRoomPlayer(player));
 
     return player;
+  }
+
+  /** Adds a server-driven AI opponent; only possible between races. */
+  addBot(difficulty: BotDifficulty): Player | null {
+    if (this.state !== 'waiting' && this.state !== 'results') return null;
+    if (this.isFull()) return null;
+
+    const players = Array.from(this.players.values());
+    const usedNames = new Set(players.map(p => p.nickname));
+    const nickname = BOT_NAMES.find(name => !usedNames.has(name)) ??
+      `Bot ${players.filter(p => p.isBot).length + 1}`;
+    const color = getAvailableColor(players.map(p => p.color)) || 'silver';
+    const player: Player = {
+      id: `bot-${generateUUID()}`,
+      nickname,
+      color,
+      isReady: true,
+      isConnected: true,
+      isSpectator: false,
+      joinedAt: Date.now(),
+      lastActivity: Date.now(),
+      isBot: true,
+      botDifficulty: difficulty,
+    };
+    this.players.set(player.id, player);
+    this.lastActivity = Date.now();
+    this.requestRacingLine();
+    this.emit('player_joined', this.toRoomPlayer(player));
+    return player;
+  }
+
+  removeBot(playerId: string): boolean {
+    if (!this.players.get(playerId)?.isBot) return false;
+    this.removePlayer(playerId);
+    return true;
+  }
+
+  /** Builds the AI racing line in the background, ideally long before the race starts. */
+  private requestRacingLine(): void {
+    if (this.racingLineRequested) return;
+    this.racingLineRequested = true;
+    void prepareRacingLine(this.track).then(line => {
+      this.racingLine = line;
+    });
   }
 
   removePlayer(playerId: string): void {
@@ -246,11 +309,13 @@ export class GameRoom {
 
     this.players.delete(playerId);
     this.cars.delete(playerId);
+    this.botDrivers.delete(playerId);
     this.physics.removeCar(playerId);
 
     // Assign new host if needed
-    if (playerId === this.hostId && this.players.size > 0) {
-      this.hostId = Array.from(this.players.keys())[0]!;
+    if (playerId === this.hostId) {
+      const nextHost = this.getHumanPlayers()[0];
+      if (nextHost) this.hostId = nextHost.id;
     }
 
     this.emit('player_left', { playerId, reason: 'left' });
@@ -279,7 +344,8 @@ export class GameRoom {
     if (this.state !== 'waiting' && this.state !== 'results') return false;
     if (this.players.size < GAME_CONSTANTS.MIN_PLAYERS_TO_START) return false;
     
-    const readyCount = Array.from(this.players.values()).filter(p => p.isReady).length;
+    // Bots are always ready, so at least one human must be ready too.
+    const readyCount = this.getHumanPlayers().filter(p => p.isReady).length;
     return readyCount >= GAME_CONSTANTS.MIN_PLAYERS_TO_START;
   }
 
@@ -292,9 +358,11 @@ export class GameRoom {
     this.gameState.countdown = GAME_CONSTANTS.COUNTDOWN_SECONDS;
 
     // Create cars for all ready players
+    this.botDrivers.clear();
     for (const player of this.players.values()) {
       if (player.isReady) {
         this.createCarForPlayer(player);
+        if (player.isBot) this.requestRacingLine();
       }
     }
 
@@ -348,31 +416,13 @@ export class GameRoom {
   }
 
   private createCarForPlayer(player: Player): void {
-    const spawnIndex = this.cars.size;
-    const spawnElements = this.track.elements?.filter(el => el.type === 'spawn') || [];
-    
-    console.log('🚗 SPAWN DEBUG: Creating car for player', player.nickname);
-    console.log('  Spawn index:', spawnIndex);
-    console.log('  Available spawn elements:', spawnElements.length);
-    
-    if (spawnElements.length === 0) {
+    // Cars fill the grid from pole position backwards in join order.
+    const gridIndex = this.cars.size;
+    const spawn = computeStartGrid(this.track, gridIndex + 1)[gridIndex];
+    if (!spawn) {
       console.log('❌ No spawn elements found!');
       return;
     }
-    
-    const spawnElement = spawnElements[spawnIndex % spawnElements.length];
-    const spawn = {
-      index: spawnIndex,
-      position: { 
-        x: spawnElement.x + spawnElement.width / 2, 
-        y: spawnElement.y + spawnElement.height / 2 
-      },
-      rotation: spawnElement.rotation || 0
-    };
-    
-    console.log('  Selected spawn:', spawn);
-    
-    if (!spawn) return;
 
     const car = createInitialCarState(
       generateUUID(),
@@ -380,10 +430,6 @@ export class GameRoom {
       spawn.position,
       spawn.rotation
     );
-
-    console.log('🚗 SPAWN DEBUG: Created car state:');
-    console.log('  Car position:', car.position);
-    console.log('  Car rotation:', car.rotation);
 
     this.cars.set(player.id, car);
     this.physics.addCar(car);
@@ -420,6 +466,7 @@ export class GameRoom {
 
     while (this.physicsAccumulator >= GAME_CONSTANTS.PHYSICS_DELTA && this.state === 'racing') {
       this.physicsAccumulator -= GAME_CONSTANTS.PHYSICS_DELTA;
+      this.driveBots();
       const events = this.physics.update(GAME_CONSTANTS.PHYSICS_DELTA / 1000);
       for (const event of events) {
         this.handlePhysicsEvent(event);
@@ -429,6 +476,27 @@ export class GameRoom {
       }
       this.updateRankings();
       this.checkRaceCompletion();
+    }
+  }
+
+  /** AI inputs are decided every physics step from the same state the physics will advance. */
+  private driveBots(): void {
+    if (!this.racingLine) return;
+    const cars = Array.from(this.cars.values());
+    for (const player of this.players.values()) {
+      if (!player.isBot) continue;
+      const car = this.cars.get(player.id);
+      if (!car) continue;
+      let driver = this.botDrivers.get(player.id);
+      if (!driver) {
+        driver = new BotDriver(player.id, this.racingLine, player.botDifficulty ?? 'medium');
+        this.botDrivers.set(player.id, driver);
+      }
+      const command = driver.update(car, cars, GAME_CONSTANTS.PHYSICS_DELTA);
+      if (command.respawn) {
+        this.placeCar(player.id, command.respawn.position, command.respawn.rotation);
+      }
+      this.physics.applyInput(player.id, command.input);
     }
   }
 
@@ -482,7 +550,7 @@ export class GameRoom {
 
     // Submit to leaderboard
     const player = this.players.get(playerId);
-    if (player) {
+    if (player && !player.isBot) {
       this.leaderboardManager.submitLapTime(
         this.track.id,
         player.nickname,
@@ -526,6 +594,8 @@ export class GameRoom {
     this.results.push(result);
 
     this.emit('player_finished', { playerId, position, totalTime });
+
+    if (player.isBot) return;
 
     // Submit race time
     this.leaderboardManager.submitRaceTime(
@@ -645,16 +715,23 @@ export class GameRoom {
     } : null;
     
     if (checkpoint) {
-      car.position = this.track.wrapAround
+      const position = this.track.wrapAround
         ? unwrapForTrack(checkpoint.position, car.position, this.track.width, this.track.height)
         : { ...checkpoint.position };
-      car.rotation = checkpoint.rotation;
-      car.velocity = { x: 0, y: 0 };
-      car.angularVelocity = 0;
-      
-      this.physics.resetCar(playerId, car.position, car.rotation);
+      this.placeCar(playerId, position, checkpoint.rotation);
+    } else {
+      this.pendingEvents.push({ type: 'respawn', playerId });
     }
+  }
 
+  private placeCar(playerId: string, position: { x: number; y: number }, rotation: number): void {
+    const car = this.cars.get(playerId);
+    if (!car) return;
+    car.position = { ...position };
+    car.rotation = rotation;
+    car.velocity = { x: 0, y: 0 };
+    car.angularVelocity = 0;
+    this.physics.resetCar(playerId, car.position, car.rotation);
     this.pendingEvents.push({ type: 'respawn', playerId });
   }
 
@@ -662,7 +739,7 @@ export class GameRoom {
   resetToLobby(): void {
     this.resetRaceState();
     for (const player of this.players.values()) {
-      player.isReady = false;
+      player.isReady = !!player.isBot;
     }
   }
 
@@ -677,6 +754,7 @@ export class GameRoom {
     };
 
     this.cars.clear();
+    this.botDrivers.clear();
     this.results = [];
     this.pendingEvents = [];
     this.startedAt = 0;

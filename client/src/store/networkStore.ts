@@ -18,6 +18,7 @@ import {
   InputState,
   DEFAULT_INPUT_STATE,
   PlayerInput,
+  BotDifficulty,
 } from '@shared';
 
 interface NetworkState {
@@ -54,6 +55,8 @@ interface NetworkState {
   leaveRoom: () => void;
   setReady: (ready: boolean) => void;
   startGame: () => void;
+  addBot: (difficulty: BotDifficulty) => void;
+  removeBot: (playerId: string) => void;
   
   // In-game actions
   sendInput: (input: InputState) => void;
@@ -183,6 +186,15 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   startGame: () => {
     set({ error: null });
     get().send({ type: 'start_game' });
+  },
+
+  addBot: (difficulty) => {
+    set({ error: null });
+    get().send({ type: 'add_bot', difficulty });
+  },
+
+  removeBot: (playerId) => {
+    get().send({ type: 'remove_bot', playerId });
   },
 
   sendInput: (input) => {

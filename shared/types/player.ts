@@ -9,7 +9,14 @@ export interface Player {
   isSpectator: boolean;
   joinedAt: number;
   lastActivity: number;
+  // Server-driven AI opponent; has no socket connection.
+  isBot?: boolean;
+  botDifficulty?: BotDifficulty;
 }
+
+export type BotDifficulty = 'easy' | 'medium' | 'hard';
+
+export const BOT_DIFFICULTIES: BotDifficulty[] = ['easy', 'medium', 'hard'];
 
 export type CarColor = 
   | 'red'

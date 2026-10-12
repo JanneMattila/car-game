@@ -2,8 +2,21 @@ import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useNetworkStore } from '../store/networkStore';
 import { useSettingsStore } from '../store/settingsStore';
-import { CAR_COLORS, COLOR_ORDER, RoomState, CarColor } from '@shared';
+import {
+  CAR_COLORS,
+  COLOR_ORDER,
+  RoomState,
+  CarColor,
+  BotDifficulty,
+  BOT_DIFFICULTIES,
+} from '@shared';
 import './WaitingRoom.css';
+
+const DIFFICULTY_LABELS: Record<BotDifficulty, string> = {
+  easy: 'Easy',
+  medium: 'Medium',
+  hard: 'Hard',
+};
 
 function WaitingRoom() {
   const navigate = useNavigate();
@@ -14,6 +27,8 @@ function WaitingRoom() {
     leaveRoom, 
     setReady, 
     startGame,
+    addBot,
+    removeBot,
     trackList,
     requestTrackList,
   } = useNetworkStore();
@@ -21,6 +36,7 @@ function WaitingRoom() {
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [copied, setCopied] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [botDifficulty, setBotDifficulty] = useState<BotDifficulty>('medium');
 
   useEffect(() => {
     requestTrackList();
@@ -37,6 +53,8 @@ function WaitingRoom() {
   const canStart = (room.state === 'waiting' || room.state === 'results')
     && allReady && room.players.length >= 1;
   const raceActive = room.state === 'countdown' || room.state === 'racing';
+  const canManageBots = isHost && !raceActive;
+  const roomFull = room.players.length >= room.maxPlayers;
 
   const handleLeave = () => {
     leaveRoom();
@@ -106,18 +124,36 @@ function WaitingRoom() {
                     <span className="player-name">
                       {player.nickname}
                       {player.isHost && <span className="host-badge">HOST</span>}
+                      {player.isBot && (
+                        <span className="bot-badge">
+                          AI · {DIFFICULTY_LABELS[player.botDifficulty ?? 'medium']}
+                        </span>
+                      )}
                     </span>
                     <span className={`ready-status ${player.ready ? 'ready' : ''}`}>
                       {player.ready ? '✓ Ready' : 'Not Ready'}
                     </span>
                   </div>
-                  {isHost && player.id !== localPlayerId && (
-                    <button 
-                      className="btn btn-ghost btn-small kick-btn"
-                      onClick={() => handleKickPlayer(player.id)}
-                    >
-                      ✕
-                    </button>
+                  {player.isBot ? (
+                    canManageBots && (
+                      <button
+                        className="btn btn-ghost btn-small kick-btn bot-remove-btn"
+                        onClick={() => removeBot(player.id)}
+                        aria-label={`Remove ${player.nickname}`}
+                        title="Remove AI player"
+                      >
+                        ✕
+                      </button>
+                    )
+                  ) : (
+                    isHost && player.id !== localPlayerId && (
+                      <button 
+                        className="btn btn-ghost btn-small kick-btn"
+                        onClick={() => handleKickPlayer(player.id)}
+                      >
+                        ✕
+                      </button>
+                    )
                   )}
                 </div>
               ))}
@@ -131,6 +167,30 @@ function WaitingRoom() {
                 </div>
               ))}
             </div>
+            {canManageBots && (
+              <div className="add-bot-row">
+                <label htmlFor="bot-difficulty">AI opponent</label>
+                <select
+                  id="bot-difficulty"
+                  className="input bot-difficulty-select"
+                  value={botDifficulty}
+                  onChange={event => setBotDifficulty(event.target.value as BotDifficulty)}
+                >
+                  {BOT_DIFFICULTIES.map(difficulty => (
+                    <option key={difficulty} value={difficulty}>
+                      {DIFFICULTY_LABELS[difficulty]}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => addBot(botDifficulty)}
+                  disabled={roomFull}
+                >
+                  🤖 Add AI
+                </button>
+              </div>
+            )}
           </section>
 
           <section className="room-info-section">

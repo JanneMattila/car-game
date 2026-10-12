@@ -119,7 +119,7 @@ export class RoomManager {
       return { success: false, error: 'Room not found' };
     }
 
-    if (room.isFull()) {
+    if (!room.canSeatHuman()) {
       return { success: false, error: 'Room is full' };
     }
 
