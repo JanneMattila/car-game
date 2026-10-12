@@ -411,10 +411,33 @@ The `deploy-to-azure.ps1` script automatically:
 - ✅ Checks that the target App Service exists
 - ✅ Builds both client and server applications
 - ✅ Creates optimized deployment package (removes devDependencies)
+- ✅ Includes Git-tracked circuit JSON files from `data/tracks`, excluding local
+  custom tracks, leaderboards and replays
 - ✅ Configures App Service settings for Node.js
 - ✅ Deploys using Azure App Service deployment API
 - ✅ Provides useful post-deployment commands
 - ✅ Handles cleanup of temporary files
+
+Tracks are loaded automatically from `DATA_DIR/tracks` when the server starts.
+With the default `DATA_DIR=./data`, deploying the packaged circuits makes them
+available in the lobby and editor's Load list after the application restarts.
+No manual editor import or template generation is required. A committed circuit
+must be included in the deployment ZIP, not just in the client bundle.
+
+Packaging uses an isolated temporary staging directory; it never deletes the
+repository's `data` folder or rewrites the source `package.json`. To inspect a ZIP
+without contacting Azure, run:
+
+```powershell
+.\scripts\CreateDeploymentPackage.ps1 -SourceDirectory . -DestinationPath .\deploy.zip
+```
+
+Build first with `npm run localbuild`. The ZIP should contain
+`data/tracks/*.json` alongside `dist` and the production `package.json`.
+If you override `DATA_DIR` to a separate persistent location, the server reads
+that location instead of the packaged `./data`; copy the new circuit JSON files
+into its `tracks` directory without deleting existing tracks or player data,
+then restart the app. Deployment does not synchronize a custom `DATA_DIR`.
 
 ### 5. Monitor Deployment
 

@@ -198,36 +198,14 @@ if (Test-Path $zipFullPath) {
     Remove-Item -Path $zipFullPath -Force
 }
 
-# Zip dist, package.json (production only), and data folder
-$itemsToZip = @("dist")
-
-# Create production package.json without devDependencies
-$pkgJson = Get-Content "package.json" -Raw | ConvertFrom-Json
-$pkgJson.PSObject.Properties.Remove("devDependencies")
-$pkgJson | ConvertTo-Json -Depth 10 | Set-Content "package.json.prod"
-Copy-Item "package.json" "package.json.bak" -Force
-Move-Item "package.json.prod" "package.json" -Force
-$itemsToZip += "package.json"
-
-if (Test-Path "server/data") {
-    Copy-Item -Path "server/data" -Destination "data" -Recurse -Force
-    $itemsToZip += "data"
-}
-
 try {
-    Compress-Archive -Path $itemsToZip -DestinationPath $zipFullPath -Force
+    & (Join-Path $PSScriptRoot "scripts/CreateDeploymentPackage.ps1") `
+        -SourceDirectory $PSScriptRoot `
+        -DestinationPath $zipFullPath
     Write-Success "Deployment package created: $zipPath"
 } catch {
     Write-Error "Failed to create deployment package: $_"
     exit 1
-} finally {
-    # Restore original package.json
-    Move-Item "package.json.bak" "package.json" -Force
-}
-
-# Clean up temp data folder
-if (Test-Path "data") {
-    Remove-Item -Path "data" -Recurse -Force
 }
 
 $zipSize = (Get-Item $zipFullPath).Length / 1MB
