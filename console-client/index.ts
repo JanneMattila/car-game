@@ -2,10 +2,10 @@
  * Console Client for Car Game
  * 
  * A headless client that mirrors the web client exactly:
- * - Client-side prediction (simulateStep on every input)
- * - Server reconciliation (replay pending inputs on server state)
+ * - Client-side prediction (shared PredictionEngine, one input per 60 Hz step)
+ * - Server reconciliation (replay unacknowledged inputs when the server disagrees)
  * - Continuous prediction frames at 60fps (predictFrame)
- * - Interpolation for remote cars (position lerping)
+ * - Snapshot interpolation for remote cars
  * - Track bounds / wrap-around handling
  * 
  * Usage: npm run dev:console
@@ -30,333 +30,33 @@ import {
   GameStateSnapshot,
   CarStateSnapshot,
   CarState,
-  PlayerInput,
   GameSettings,
   RaceResult,
   Track,
   RoomInfo,
   Player,
   GameEvent,
-  InputState,
-  DEFAULT_INPUT_STATE,
   GAME_CONSTANTS,
-  PHYSICS_CONSTANTS,
-  RENDER_CONSTANTS,
+  INTERPOLATION_DELAY_MS,
+  PredictionEngine,
+  PredictionOpponent,
+  ServerClock,
+  SnapshotInterpolator,
   deserializeCarState,
-  vec2Lerp,
-  lerpAngle,
-  vec2Distance,
-  getSteeringInput,
-  WallPredictionWorld,
-  stepNitro,
-  RoadSurfaceIndex,
-  drivingResistance,
 } from '../shared/index.js';
 
-// ── Client-side prediction ──────────────────────────────────────────
-// Mirrors client/src/game/clientPrediction.ts exactly
-
-interface PredictedState {
-  x: number;
-  y: number;
-  rotation: number;
-  vx: number;
-  vy: number;
-  angularVelocity: number;
-  nitroAmount?: number;
-  layer?: number;
-}
-
-interface InputRecord {
-  sequence: number;
-  timestamp: number;
-  accelerate: boolean;
-  brake: boolean;
-  steerLeft: boolean;
-  steerRight: boolean;
-  steerValue: number;
-  nitro: boolean;
-  handbrake: boolean;
-}
-
-// Prediction state (mirrors clientPrediction.ts module state)
-const pendingInputs: InputRecord[] = [];
-let lastConfirmedSequence = 0;
-let predictedState: PredictedState | null = null;
-let previousState: PredictedState | null = null; // For render interpolation
-let currentInput: InputRecord | null = null;
-
-const DELTA_TIME = 1 / 60;
-const MAX_PENDING_INPUTS = 120;
-let physicsAccumulator = 0;
-let wallWorld: WallPredictionWorld | null = null;
-let roadSurface: RoadSurfaceIndex | null = null;
+// ── Client-side prediction and remote interpolation ─────────────────
+// The same shared engine as the browser (client/src/game/clientPrediction.ts): one input per
+// 60 Hz step is simulated, remembered and sent; server snapshots that disagree are replayed.
+const prediction = new PredictionEngine();
+// Remote cars are drawn from timestamped snapshots slightly in the past (mirrors gameStore.ts).
+const remoteMotion = new SnapshotInterpolator();
+const serverClock = new ServerClock();
+// Opponent collisions are predicted at most this far ahead of the newest snapshot.
+const MAX_OPPONENT_LEAD_MS = 250;
 
 function vec2Len(x: number, y: number): number {
   return Math.sqrt(x * x + y * y);
-}
-
-// Server-matching constants for Verlet integration (mirrors clientPrediction.ts)
-const SERVER_BODY_MASS  = PHYSICS_CONSTANTS.CAR_BODY_MASS;
-const MATTER_DT         = 1000 / 60;     // ms – same as baseDelta
-const MATTER_DT_SQUARED = MATTER_DT * MATTER_DT; // ≈ 277.78
-const MATTER_FRICTION_AIR = 1 - 0.01;    // 0.99 – body.frictionAir = 0.01
-
-function simulateStep(state: PredictedState, input: InputRecord): PredictedState {
-  let { x, y, rotation, vx, vy, angularVelocity } = state;
-  const nitro = stepNitro(state.nitroAmount ?? PHYSICS_CONSTANTS.NITRO_MAX, input.nitro, DELTA_TIME);
-  const resistance = drivingResistance(
-    roadSurface ? roadSurface.isAsphalt({ x, y }, state.layer ?? 0) : true,
-    wallWorld?.forceScale ?? 1
-  );
-
-  // Forward direction (same convention as server)
-  const forwardX = Math.sin(rotation);
-  const forwardY = -Math.cos(rotation);
-
-  // Speed measured at start of tick (matches server's `currentSpeed`)
-  const speed = vec2Len(vx, vy);
-  const forwardSpeed = vx * forwardX + vy * forwardY;
-  const isMovingForward  = forwardSpeed > 0.5;
-  const isMovingBackward = forwardSpeed < -0.5;
-
-  // ── 1. Accumulate forces (consumed in Verlet step below) ────────
-  let forceX = 0;
-  let forceY = 0;
-
-  // Acceleration – server: applyForce( rotate((0, -ENGINE_FORCE*0.001), angle) )
-  if (input.accelerate && speed < PHYSICS_CONSTANTS.MAX_SPEED) {
-    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001 * resistance.forceScale;
-    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001 * resistance.forceScale;
-  }
-
-  // Nitro boost – server: applyForce( rotate((0, -ENGINE_FORCE*0.0015), angle) )
-  if (nitro.boostScale > 0) {
-    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015 * nitro.boostScale * resistance.forceScale;
-    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015 * nitro.boostScale * resistance.forceScale;
-  }
-
-  // ── 2. Direct velocity modifications (setVelocity on server) ────
-
-  // Braking
-  if (input.brake) {
-    if (isMovingForward && forwardSpeed > 1) {
-      // Server: setVelocity(v * 0.95)
-      vx *= 0.95;
-      vy *= 0.95;
-    } else if (speed < PHYSICS_CONSTANTS.MAX_REVERSE_SPEED) {
-      // Server: reverse via applyForce
-      forceX -= forwardX * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001 * resistance.forceScale;
-      forceY -= forwardY * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001 * resistance.forceScale;
-    }
-  }
-
-  // ── 3. Steering (angular velocity) ─────────────────────────────
-  const steerInput = getSteeringInput(input);
-
-  if (steerInput !== 0) {
-    const minTurnSpeed = 0.5;
-    if (speed > minTurnSpeed) {
-      // Server's 3-tier speed factor
-      let speedFactor: number;
-      if (speed < 3) {
-        speedFactor = speed / 3;
-      } else if (speed < 15) {
-        speedFactor = 1.0;
-      } else {
-        speedFactor = Math.max(0.5, 15 / speed);
-      }
-      const turnForce = steerInput * PHYSICS_CONSTANTS.MAX_STEERING_ANGLE * 0.18 * speedFactor;
-      const reverseMult = isMovingBackward ? -1 : 1;
-      angularVelocity = turnForce * reverseMult;
-    }
-  } else {
-    // Server: setAngularVelocity(body.angularVelocity * 0.85)
-    angularVelocity *= 0.85;
-  }
-
-  // Server: angular velocity clamp
-  if (Math.abs(angularVelocity) > PHYSICS_CONSTANTS.MAX_ANGULAR_VELOCITY) {
-    angularVelocity = Math.sign(angularVelocity) * PHYSICS_CONSTANTS.MAX_ANGULAR_VELOCITY;
-  }
-
-  // ── 4. Drag (matches server: setVelocity *= (1 − drag·speed − rolling)) ─
-  const dragForce = PHYSICS_CONSTANTS.DRAG_COEFFICIENT * speed;
-  const rollingResistance = resistance.rollingResistance;
-  const dragFactor = 1 - dragForce - rollingResistance;
-  vx *= dragFactor;
-  vy *= dragFactor;
-
-  // ── 5. Speed clamp (server uses pre-drag `speed` for comparison) ─
-  const maxSpeed = resistance.speedScale * (nitro.boostScale > 0
-    ? PHYSICS_CONSTANTS.MAX_SPEED * PHYSICS_CONSTANTS.NITRO_BOOST_MULTIPLIER
-    : PHYSICS_CONSTANTS.MAX_SPEED);
-  if (speed > maxSpeed) {
-    const ratio = maxSpeed / speed;
-    vx *= ratio;
-    vy *= ratio;
-  }
-
-  // ── 6. Verlet integration (replaces Matter.js Body.update) ──────
-  // v = v_prev × frictionAir + (F / m) × dt²
-  vx = vx * MATTER_FRICTION_AIR + (forceX / SERVER_BODY_MASS) * MATTER_DT_SQUARED;
-  vy = vy * MATTER_FRICTION_AIR + (forceY / SERVER_BODY_MASS) * MATTER_DT_SQUARED;
-
-  // Angular: angVel × frictionAir  (torque / inertia = 0 due to Infinity inertia)
-  angularVelocity *= MATTER_FRICTION_AIR;
-  rotation += angularVelocity;
-
-  // ── 7. Position update ──────────────────────────────────────────
-  x += vx;
-  y += vy;
-
-  // Do NOT wrap — keep positions continuous for smooth camera/rendering.
-  const next = { x, y, rotation, vx, vy, angularVelocity };
-  const result = wallWorld ? wallWorld.resolve(state, next) : next;
-  return { ...result, nitroAmount: nitro.amount, layer: state.layer ?? 0 };
-}
-
-function recordInput(input: InputRecord): void {
-  pendingInputs.push({ ...input });
-  currentInput = { ...input };
-  while (pendingInputs.length > MAX_PENDING_INPUTS) {
-    pendingInputs.shift();
-  }
-}
-
-function predictFrame(deltaTime: number = DELTA_TIME): PredictedState | null {
-  if (!predictedState || !currentInput) return predictedState;
-  physicsAccumulator += deltaTime;
-  while (physicsAccumulator >= DELTA_TIME) {
-    previousState = { ...predictedState };
-    predictedState = simulateStep(predictedState, currentInput);
-    physicsAccumulator -= DELTA_TIME;
-  }
-  // Render interpolation for sub-frame smoothness
-  if (previousState && predictedState) {
-    const alpha = physicsAccumulator / DELTA_TIME;
-    const display = {
-      x: previousState.x + (predictedState.x - previousState.x) * alpha,
-      y: previousState.y + (predictedState.y - previousState.y) * alpha,
-      rotation: previousState.rotation + (predictedState.rotation - previousState.rotation) * alpha,
-      vx: predictedState.vx,
-      vy: predictedState.vy,
-      angularVelocity: predictedState.angularVelocity,
-      nitroAmount: predictedState.nitroAmount,
-      layer: predictedState.layer,
-    };
-    return wallWorld?.constrain(display) ?? display;
-  }
-  return predictedState ? wallWorld?.constrain(predictedState) ?? predictedState : null;
-}
-
-function reconcileWithServer(serverState: PredictedState, serverSequence: number): PredictedState {
-  while (pendingInputs.length > 0 && pendingInputs[0]!.sequence <= serverSequence) {
-    pendingInputs.shift();
-  }
-  lastConfirmedSequence = serverSequence;
-
-  const target = serverState;
-  if (predictedState && target.layer !== undefined) predictedState.layer = target.layer;
-  if (predictedState && target.nitroAmount !== undefined) {
-    predictedState.nitroAmount = target.nitroAmount;
-  }
-
-  if (!predictedState) {
-    predictedState = { ...target, angularVelocity: target.angularVelocity ?? 0 };
-    return predictedState;
-  }
-
-  // --- Velocity: blend toward server (not hard snap) ---
-  // Matches web client: 15% correction per server update (~20 Hz)
-  const VEL_BLEND = 0.15;
-  const dvx = target.vx - predictedState.vx;
-  const dvy = target.vy - predictedState.vy;
-  predictedState.vx += dvx * VEL_BLEND;
-  predictedState.vy += dvy * VEL_BLEND;
-
-  // --- Angular velocity: blend toward server ---
-  const serverAngVel = target.angularVelocity ?? 0;
-  const angVelDelta = serverAngVel - predictedState.angularVelocity;
-  predictedState.angularVelocity += angVelDelta * VEL_BLEND;
-
-  // --- Rotation: blend toward server ---
-  const rotDiff = Math.atan2(
-    Math.sin(target.rotation - predictedState.rotation),
-    Math.cos(target.rotation - predictedState.rotation)
-  );
-  predictedState.rotation += rotDiff * 0.3;
-
-  // --- Position: smooth correction ---
-  const dx = target.x - predictedState.x;
-  const dy = target.y - predictedState.y;
-  const dist = Math.sqrt(dx * dx + dy * dy);
-
-  const SNAP_THRESHOLD = 150; // px – respawn, stuck reset, etc.
-  const BLEND_FACTOR   = 0.1; // 10% correction per server update (~20 Hz)
-
-  if (dist > SNAP_THRESHOLD) {
-    wallWorld?.reset();
-    // Large discrepancy – hard snap
-    predictedState.x = target.x;
-    predictedState.y = target.y;
-    predictedState.rotation = target.rotation;
-    predictedState.vx = target.vx;
-    predictedState.vy = target.vy;
-    predictedState.angularVelocity = target.angularVelocity ?? 0;
-    previousState = { ...predictedState }; // Reset interpolation base
-  } else if (dist > 0.5) {
-    // Gradual correction
-    predictedState.x += dx * BLEND_FACTOR;
-    predictedState.y += dy * BLEND_FACTOR;
-    previousState = null; // Let next predictFrame rebuild interpolation
-  }
-
-  return predictedState;
-}
-
-function initializePrediction(state: PredictedState): void {
-  wallWorld?.dispose();
-  roadSurface = track ? new RoadSurfaceIndex(track) : null;
-  wallWorld = new WallPredictionWorld(track);
-  predictedState = { ...state, angularVelocity: state.angularVelocity ?? 0 };
-  previousState = null;
-  pendingInputs.length = 0;
-  lastConfirmedSequence = 0;
-  physicsAccumulator = 0;
-  currentInput = {
-    sequence: 0,
-    timestamp: Date.now(),
-    accelerate: false,
-    brake: false,
-    steerLeft: false,
-    steerRight: false,
-    steerValue: 0,
-    nitro: false,
-    handbrake: false,
-  };
-}
-
-function clearPrediction(): void {
-  wallWorld?.dispose();
-  roadSurface = null;
-  wallWorld = null;
-  predictedState = null;
-  previousState = null;
-  pendingInputs.length = 0;
-  lastConfirmedSequence = 0;
-  currentInput = null;
-  physicsAccumulator = 0;
-}
-
-function resetPredictionVelocity(): void {
-  wallWorld?.reset();
-  if (predictedState) {
-    predictedState.vx = 0;
-    predictedState.vy = 0;
-    predictedState.angularVelocity = 0;
-  }
-  pendingInputs.length = 0;
 }
 
 // ── Interpolated car state (mirrors gameStore.ts) ───────────────────
@@ -403,7 +103,6 @@ let room: RoomInfo | null = null;
 let track: Track | null = null;
 let latency = 0;
 let serverTimeOffset = 0;
-let sequenceNumber = 0;
 let lastStateTimestamp = 0;
 let lastLogTime = 0;
 let gamePhase: string = 'connecting';
@@ -477,7 +176,7 @@ function logCarState(): void {
   const tp = car.targetPosition;
   const vel = car.velocity;
   const speed = vec2Len(vel.x, vel.y);
-  const predicted = predictedState;
+  const predicted = prediction.getPredictedState();
 
   // Display position (what would be rendered)
   console.log(
@@ -488,7 +187,7 @@ function logCarState(): void {
     `speed=${C.bright}${speed.toFixed(1)}${C.reset} ` +
     `vel=(${vel.x.toFixed(2)}, ${vel.y.toFixed(2)}) ` +
     `lap=${C.yellow}${car.lap}${C.reset} cp=${car.checkpoint} ` +
-    `pending=${pendingInputs.length} ` +
+    `pending=${prediction.getPendingInputCount()} replays=${prediction.debug.replays} ` +
     `${car.finished ? C.green + 'FINISHED' + C.reset : ''}`
   );
 
@@ -500,7 +199,7 @@ function logCarState(): void {
     logPredict(`Prediction delta: ${dist.toFixed(1)}px`, {
       predicted: `(${predicted.x.toFixed(1)}, ${predicted.y.toFixed(1)})`,
       server: `(${tp.x.toFixed(1)}, ${tp.y.toFixed(1)})`,
-      pendingInputs: pendingInputs.length,
+      pendingInputs: prediction.getPendingInputCount(),
     });
   }
 
@@ -548,6 +247,8 @@ function updateFromServer(snapshot: GameStateSnapshot): void {
   for (const id of cars.keys()) {
     if (!activeIds.has(id)) cars.delete(id);
   }
+  serverClock.observe(snapshot.timestamp);
+  remoteMotion.retain(activeIds);
   for (const carSnapshot of snapshot.cars) {
     const existingCar = cars.get(carSnapshot.playerId);
     const carState = deserializeCarState(carSnapshot, existingCar);
@@ -566,10 +267,8 @@ function updateFromServer(snapshot: GameStateSnapshot): void {
 
     // Local player: server reconciliation (mirrors gameStore.ts)
     if (isLocalPlayer && existingCar) {
-      const preReconX = predictedState?.x ?? 0;
-      const preReconY = predictedState?.y ?? 0;
-
-      const reconciled = reconcileWithServer(
+      const preRecon = prediction.getPredictedState();
+      const reconciled = prediction.reconcile(
         {
           x: carState.position.x,
           y: carState.position.y,
@@ -585,97 +284,80 @@ function updateFromServer(snapshot: GameStateSnapshot): void {
 
       stats.reconciliations++;
       const reconDelta = Math.sqrt(
-        (reconciled.x - preReconX) ** 2 + (reconciled.y - preReconY) ** 2
+        (reconciled.x - (preRecon?.x ?? reconciled.x)) ** 2 +
+        (reconciled.y - (preRecon?.y ?? reconciled.y)) ** 2
       );
       stats.reconciliationDeltas.push(reconDelta);
       if (stats.reconciliationDeltas.length > 100) stats.reconciliationDeltas.shift();
-      stats.pendingInputCounts.push(pendingInputs.length);
+      stats.pendingInputCounts.push(prediction.getPendingInputCount());
       if (stats.pendingInputCounts.length > 100) stats.pendingInputCounts.shift();
 
-      const interpolatedCar: InterpolatedCar = {
+      cars.set(carSnapshot.playerId, {
         ...carState,
         position: { x: reconciled.x, y: reconciled.y },
         velocity: { x: reconciled.vx, y: reconciled.vy },
         rotation: reconciled.rotation,
-        targetPosition: { x: reconciled.x, y: reconciled.y },
-        targetRotation: reconciled.rotation,
-        displayPosition: { x: reconciled.x, y: reconciled.y },
-        displayRotation: reconciled.rotation,
-      };
-
-      cars.set(carSnapshot.playerId, interpolatedCar);
+        targetPosition: { x: carState.position.x, y: carState.position.y },
+        targetRotation: carState.rotation,
+        displayPosition: existingCar.displayPosition,
+        displayRotation: existingCar.displayRotation,
+      });
       continue;
     }
 
-    // Remote players: interpolation (mirrors gameStore.ts)
+    // Remote players: timestamped snapshot buffer (mirrors gameStore.ts)
     const serverPos = carState.position;
-
-    const shouldSnap = existingCar
-      ? vec2Distance(existingCar.displayPosition, serverPos) > RENDER_CONSTANTS.TELEPORT_THRESHOLD
-      : true;
-
-    const interpolatedCar: InterpolatedCar = {
+    remoteMotion.push(carSnapshot.playerId, {
+      time: snapshot.timestamp,
+      x: serverPos.x,
+      y: serverPos.y,
+      rotation: carState.rotation,
+      vx: carState.velocity.x,
+      vy: carState.velocity.y,
+      angularVelocity: carState.angularVelocity ?? 0,
+    });
+    cars.set(carSnapshot.playerId, {
       ...carState,
       targetPosition: { ...serverPos },
       targetRotation: carState.rotation,
-      displayPosition: shouldSnap
-        ? { ...serverPos }
-        : existingCar?.displayPosition ?? { ...serverPos },
-      displayRotation: shouldSnap
-        ? carState.rotation
-        : existingCar?.displayRotation ?? carState.rotation,
-    };
-
-    cars.set(carSnapshot.playerId, interpolatedCar);
+      displayPosition: existingCar?.displayPosition ?? { ...serverPos },
+      displayRotation: existingCar?.displayRotation ?? carState.rotation,
+    });
   }
 }
 
 // ── Interpolation loop (mirrors gameStore.ts interpolate) ──────────
 
 function interpolate(deltaTime: number): void {
-  const lerpFactor = RENDER_CONSTANTS.POSITION_LERP_FACTOR;
-  const rotationLerpFactor = RENDER_CONSTANTS.ROTATION_LERP_FACTOR;
   const clampedDeltaTime = Math.min(deltaTime, 0.1);
+  const synchronized = serverClock.synchronized;
+  const renderTime = serverClock.serverTime() - INTERPOLATION_DELAY_MS;
+  // The local car is predicted about one round trip ahead of the newest snapshot.
+  const opponentTime = serverClock.serverTime() + 2 * latency;
+  const opponents: PredictionOpponent[] = [];
 
   for (const [pid, car] of cars) {
     if (pid === playerId) continue;
-
-    // Remote players: lerp toward target (mirrors gameStore.ts)
-    if (!Number.isFinite(car.displayPosition.x) || !Number.isFinite(car.displayPosition.y)) {
-      car.displayPosition = { ...car.targetPosition };
-    }
-    if (!Number.isFinite(car.targetPosition.x) || !Number.isFinite(car.targetPosition.y)) {
-      continue;
-    }
-
-    const newDisplayPosition = vec2Lerp(
-      car.displayPosition,
-      car.targetPosition,
-      Math.min(1, lerpFactor * clampedDeltaTime * 60)
-    );
-
-    const newDisplayRotation = lerpAngle(
-      car.displayRotation,
-      car.targetRotation,
-      Math.min(1, rotationLerpFactor * clampedDeltaTime * 60)
-    );
-
-    const finalPosition = (Number.isFinite(newDisplayPosition.x) && Number.isFinite(newDisplayPosition.y))
-      ? newDisplayPosition
-      : car.targetPosition;
-
-    cars.set(pid, {
-      ...car,
-      displayPosition: finalPosition,
-      displayRotation: Number.isFinite(newDisplayRotation) ? newDisplayRotation : car.targetRotation,
+    const shown = synchronized ? remoteMotion.sample(pid, renderTime) : null;
+    const ahead = synchronized ? remoteMotion.sample(pid, opponentTime, MAX_OPPONENT_LEAD_MS) : null;
+    const displayPosition = shown?.position ?? car.displayPosition;
+    const displayRotation = shown?.rotation ?? car.displayRotation;
+    cars.set(pid, { ...car, displayPosition, displayRotation });
+    opponents.push(ahead ? { playerId: pid, ...ahead } : {
+      playerId: pid,
+      position: displayPosition,
+      rotation: displayRotation,
+      velocity: car.velocity,
+      angularVelocity: car.angularVelocity ?? 0,
     });
   }
-  wallWorld?.setOpponents([...cars.values()].filter(car => car.playerId !== playerId).map(car => ({
-    ...car, position: car.displayPosition, rotation: car.displayRotation,
-  })));
+  prediction.setOpponents(opponents);
+
   const localCar = playerId ? cars.get(playerId) : null;
-  if (localCar && playerId) {
-    const predicted = predictFrame(clampedDeltaTime);
+  if (localCar && playerId && gamePhase === 'racing') {
+    const predicted = prediction.predictFrame(clampedDeltaTime, input => {
+      sendMessage({ type: 'input', input: { ...input, playerId: playerId!, respawn: !!input.respawn } });
+    });
     if (predicted) {
       stats.predictionFrames++;
       cars.set(playerId, {
@@ -691,6 +373,8 @@ function interpolate(deltaTime: number): void {
 // ── Initialize cars (mirrors gameStore.ts initializeCars) ──────────
 
 function initializeCars(carSnapshots: CarStateSnapshot[]): void {
+  remoteMotion.clear();
+  serverClock.reset();
   for (const carSnapshot of carSnapshots) {
     const carState = deserializeCarState(carSnapshot, undefined);
     const interpolatedCar: InterpolatedCar = {
@@ -704,7 +388,7 @@ function initializeCars(carSnapshots: CarStateSnapshot[]): void {
 
     // Initialize prediction for local player
     if (carSnapshot.playerId === playerId) {
-      initializePrediction({
+      prediction.initialize({
         x: carState.position.x,
         y: carState.position.y,
         rotation: carState.rotation,
@@ -713,29 +397,24 @@ function initializeCars(carSnapshots: CarStateSnapshot[]): void {
         angularVelocity: carState.angularVelocity ?? 0,
         nitroAmount: carState.nitroAmount,
         layer: carState.layer,
-      });
+      }, track);
     }
   }
 }
 
 // ── Input ──────────────────────────────────────────────────────────
 
-function getAutoDriveInput(): PlayerInput {
-  sequenceNumber++;
-  return {
-    ...getDrivingInput(DRIVE_PATTERN, Date.now() - raceStartTime),
-    playerId: playerId!,
-    sequence: sequenceNumber,
-    timestamp: Date.now(),
-  };
-}
-
-function getManualInput(): PlayerInput {
-  sequenceNumber++;
-  return {
-    playerId: playerId!,
-    sequence: sequenceNumber,
-    timestamp: Date.now(),
+/**
+ * Updates the held controls (mirrors InputHandler.ts). Prediction turns them into one input per
+ * physics step and sends it, exactly like the browser.
+ */
+function updateControls(): void {
+  if (gamePhase !== 'racing' || !playerId) return;
+  if (AUTO_DRIVE) {
+    prediction.setControls(getDrivingInput(DRIVE_PATTERN, Date.now() - raceStartTime));
+    return;
+  }
+  prediction.setControls({
     accelerate: manualInput.accelerate,
     brake: manualInput.brake,
     steerLeft: manualInput.steerLeft,
@@ -743,35 +422,9 @@ function getManualInput(): PlayerInput {
     steerValue: manualInput.steerLeft ? -1 : manualInput.steerRight ? 1 : 0,
     nitro: manualInput.nitro,
     handbrake: manualInput.handbrake,
-    respawn: manualInput.respawn,
-  };
-}
-
-function sendInputAndPredict(): void {
-  if (gamePhase !== 'racing' || !playerId) return;
-
-  const input = AUTO_DRIVE ? getAutoDriveInput() : getManualInput();
-  sendMessage({ type: 'input', input });
-
-  // Record input for reconciliation.
-  // The prediction loop's predictFrame() handles all physics stepping —
-  // we do NOT do prediction here to avoid double-step jitter.
-  // (Matches web client InputHandler.ts pattern.)
-  const inputRecord: InputRecord = {
-    sequence: input.sequence,
-    timestamp: input.timestamp,
-    accelerate: input.accelerate,
-    brake: input.brake,
-    steerLeft: input.steerLeft,
-    steerRight: input.steerRight,
-    steerValue: input.steerValue,
-    nitro: input.nitro,
-    handbrake: input.handbrake,
-  };
-  recordInput(inputRecord);
-
-  // Reset one-shot inputs
-  if (!AUTO_DRIVE) {
+  });
+  if (manualInput.respawn) {
+    prediction.requestRespawn();
     manualInput.respawn = false;
   }
 }
@@ -921,7 +574,7 @@ function handleMessage(message: ServerMessage): void {
       gamePhase = 'results';
       logRaceResults(message.results);
       stopGameLoops();
-      clearPrediction();
+      prediction.clear();
       break;
 
     case 'collision':
@@ -979,7 +632,7 @@ function handleGameState(state: GameStateSnapshot): void {
   if (state.events) {
     for (const event of state.events) {
       if (event.type === 'respawn' && event.playerId === playerId) {
-        resetPredictionVelocity();
+        prediction.handleRespawn();
         stats.respawns++;
         logEvent('Respawn', { playerId: event.playerId });
       }
@@ -1040,14 +693,15 @@ function createRoom(): void {
 
 // ── Game loops (mirrors web client game loop architecture) ──────────
 // The web client has:
-//   1. InputHandler: on keydown → sendInput + recordInput + predictLocalMovement (event-driven)
-//   2. GameRenderer ticker: every frame → gameStore.interpolate(dt) which calls predictFrame()
-//   3. networkStore._handleMessage: on game_state → gameStore.updateFromServer → reconcileWithServer
+//   1. InputHandler: on key/touch/tilt changes → setCurrentInput (held controls)
+//   2. GameRenderer ticker: every frame → gameStore.interpolate(dt) → predictFrame(dt, send),
+//      which simulates and sends one input per 60 Hz step
+//   3. networkStore._handleMessage: on game_state → gameStore.updateFromServer → reconcile
 //
 // Console client mirrors this with:
-//   1. inputInterval: every INPUT_TICK_MS → sendInputAndPredict (recordInput + predictLocalMovement)
-//   2. predictionInterval: every PREDICTION_TICK_MS → interpolate(dt) which calls predictFrame()
-//   3. handleMessage 'game_state' → updateFromServer → reconcileWithServer
+//   1. inputInterval: every INPUT_TICK_MS → updateControls (held controls)
+//   2. predictionInterval: every PREDICTION_TICK_MS → interpolate(dt) → predictFrame(dt, send)
+//   3. handleMessage 'game_state' → updateFromServer → reconcile
 
 let inputInterval: ReturnType<typeof setInterval> | null = null;
 let predictionInterval: ReturnType<typeof setInterval> | null = null;
@@ -1059,8 +713,9 @@ function startGameLoops(): void {
   logGame(`Loops started: input=${INPUT_TICK_MS}ms prediction=${PREDICTION_TICK_MS}ms auto_drive=${AUTO_DRIVE}`);
   if (AUTO_DRIVE) logGame(`Driving pattern: ${DRIVE_PATTERN}`);
 
-  // Input loop at physics tick rate (60Hz)
-  inputInterval = setInterval(sendInputAndPredict, INPUT_TICK_MS);
+  // Held-controls loop at physics tick rate (60Hz)
+  updateControls();
+  inputInterval = setInterval(updateControls, INPUT_TICK_MS);
 
   // Prediction/interpolation loop at 60fps
   lastPredictionTime = performance.now();
@@ -1204,7 +859,7 @@ function shutdown(): void {
   logNet('Shutting down...');
 
   stopGameLoops();
-  clearPrediction();
+  prediction.clear();
   if (pingInterval) clearInterval(pingInterval);
 
   console.log('\n' + C.bright + '═══ Session Stats ═══' + C.reset);

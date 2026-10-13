@@ -19,6 +19,8 @@ export * from './utils/math';
 export * from './utils/validation';
 export * from './utils/roadGeometry';
 export * from './utils/wallPhysics';
+export * from './utils/predictionEngine';
+export * from './utils/snapshotInterpolation';
 export * from './utils/drivingResistance';
 export * from './utils/nitro';
 export * from './utils/raceGates';

@@ -57,6 +57,29 @@ export function createTrackWall(element: TrackElement, offset: Vector2): Matter.
   );
 }
 
+// Prediction only needs the walls a car can reach within a few frames. Keeping the rest out of
+// the Matter world makes each step (and each reconciliation replay) independent of track size.
+const WALL_WINDOW_RADIUS = 600;
+const WALL_WINDOW_REFRESH = 150;
+
+interface WallBounds {
+  element: TrackElement;
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+function wallBounds(element: TrackElement): WallBounds {
+  const cosine = Math.abs(Math.cos(element.rotation || 0));
+  const sine = Math.abs(Math.sin(element.rotation || 0));
+  const halfX = (element.width * cosine + element.height * sine) / 2;
+  const halfY = (element.width * sine + element.height * cosine) / 2;
+  const cx = element.x + element.width / 2;
+  const cy = element.y + element.height / 2;
+  return { element, minX: cx - halfX, maxX: cx + halfX, minY: cy - halfY, maxY: cy + halfY };
+}
+
 // Opponents are kinematic: the server, not local prediction, owns their motion.
 export class WallPredictionWorld {
   private engine = Matter.Engine.create({
@@ -65,8 +88,9 @@ export class WallPredictionWorld {
     velocityIterations: 4,
   });
   private body = createVehicleBody({ x: 0, y: 0 }, 0);
-  private wallElements: TrackElement[];
-  private tiles = new Map<string, Matter.Body[]>();
+  private wallElements: WallBounds[];
+  private walls = new Map<string, Matter.Body>();
+  private windowCenter: Vector2 | null = null;
   private opponents = new Map<string, Matter.Body>();
   contacts = 0;
   carContacts = 0;
@@ -77,37 +101,69 @@ export class WallPredictionWorld {
   }
 
   constructor(private track: Track | null) {
-    this.wallElements =
-      track?.elements.filter(el => el.type === 'wall' || el.type === 'barrier') ?? [];
+    this.wallElements = (
+      track?.elements.filter(el => el.type === 'wall' || el.type === 'barrier') ?? []
+    ).map(wallBounds);
     // Kinematics have already applied air resistance before this collision step.
     this.body.frictionAir = 0;
     Matter.World.add(this.engine.world, this.body);
   }
 
+  /** Number of wall bodies currently simulated around the car. */
+  get activeWallCount(): number {
+    return this.walls.size;
+  }
+
   private updateTiles(position: Vector2): void {
     if (!this.track) return;
-    const needed = new Map<string, Vector2>();
-    if (!this.track.wrapAround) {
-      needed.set('0:0', { x: 0, y: 0 });
+    if (
+      this.windowCenter &&
+      Math.hypot(position.x - this.windowCenter.x, position.y - this.windowCenter.y) <
+        WALL_WINDOW_REFRESH
+    ) {
+      return;
+    }
+    this.windowCenter = { x: position.x, y: position.y };
+    const { width, height, wrapAround } = this.track;
+    const offsets: Vector2[] = [];
+    if (!wrapAround) {
+      offsets.push({ x: 0, y: 0 });
     } else {
-      const tx = Math.floor(position.x / this.track.width);
-      const ty = Math.floor(position.y / this.track.height);
+      // Repeating terrain: consider the copies of the tile around the car.
+      const tx = Math.floor(position.x / width);
+      const ty = Math.floor(position.y / height);
       for (let x = tx - 1; x <= tx + 1; x++) {
-        for (let y = ty - 1; y <= ty + 1; y++) {
-          needed.set(`${x}:${y}`, { x: x * this.track.width, y: y * this.track.height });
-        }
+        for (let y = ty - 1; y <= ty + 1; y++) offsets.push({ x: x * width, y: y * height });
       }
     }
-    for (const [key, offset] of needed) {
-      if (this.tiles.has(key)) continue;
-      const walls = this.wallElements.map(element => createTrackWall(element, offset));
-      Matter.World.add(this.engine.world, walls);
-      this.tiles.set(key, walls);
+    const needed = new Map<string, { element: TrackElement; offset: Vector2 }>();
+    const minX = position.x - WALL_WINDOW_RADIUS;
+    const maxX = position.x + WALL_WINDOW_RADIUS;
+    const minY = position.y - WALL_WINDOW_RADIUS;
+    const maxY = position.y + WALL_WINDOW_RADIUS;
+    for (const offset of offsets) {
+      this.wallElements.forEach((wall, index) => {
+        if (
+          wall.maxX + offset.x < minX ||
+          wall.minX + offset.x > maxX ||
+          wall.maxY + offset.y < minY ||
+          wall.minY + offset.y > maxY
+        ) {
+          return;
+        }
+        needed.set(`${index}:${offset.x}:${offset.y}`, { element: wall.element, offset });
+      });
     }
-    for (const [key, walls] of this.tiles) {
+    for (const [key, { element, offset }] of needed) {
+      if (this.walls.has(key)) continue;
+      const wall = createTrackWall(element, offset);
+      Matter.World.add(this.engine.world, wall);
+      this.walls.set(key, wall);
+    }
+    for (const [key, wall] of this.walls) {
       if (needed.has(key)) continue;
-      walls.forEach(wall => Matter.World.remove(this.engine.world, wall));
-      this.tiles.delete(key);
+      Matter.World.remove(this.engine.world, wall);
+      this.walls.delete(key);
     }
   }
 
@@ -157,7 +213,7 @@ export class WallPredictionWorld {
     const opponents = [...this.opponents.values()];
     if (Matter.Query.collides(this.body, opponents).length === 0) return state;
     this.updateTiles(state);
-    const obstacles = [...opponents, ...[...this.tiles.values()].flat()];
+    const obstacles = [...opponents, ...this.walls.values()];
     for (let iteration = 0; iteration < 12; iteration++) {
       const collisions = Matter.Query.collides(this.body, obstacles);
       if (collisions.length === 0) break;
@@ -201,7 +257,8 @@ export class WallPredictionWorld {
   dispose(): void {
     Matter.World.clear(this.engine.world, false);
     Matter.Engine.clear(this.engine);
-    this.tiles.clear();
+    this.walls.clear();
+    this.windowCenter = null;
     this.opponents.clear();
     this.contacts = 0;
     this.carContacts = 0;

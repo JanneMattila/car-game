@@ -23,6 +23,7 @@ function DebugOverlay({ localPlayerId }: DebugOverlayProps) {
     serverUpdates: 0,
     serverHz: 0,
     pendingInputs: 0,
+    replays: 0,
     latency: 0,
     predictedX: 0,
     predictedY: 0,
@@ -98,6 +99,7 @@ function DebugOverlay({ localPlayerId }: DebugOverlayProps) {
         serverUpdates: debug.serverUpdateCount,
         serverHz,
         pendingInputs: getPendingInputCount(),
+        replays: debug.replays,
         latency,
         predictedX: predicted?.x ?? 0,
         predictedY: predicted?.y ?? 0,
@@ -233,6 +235,10 @@ function DebugOverlay({ localPlayerId }: DebugOverlayProps) {
         <div className="debug-row">
           <span className="debug-label">Pending inputs</span>
           <span className="debug-value">{stats.pendingInputs}</span>
+        </div>
+        <div className="debug-row">
+          <span className="debug-label">Prediction replays</span>
+          <span className="debug-value">{stats.replays}</span>
         </div>
       </div>
 

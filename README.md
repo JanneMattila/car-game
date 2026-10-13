@@ -170,8 +170,9 @@ the game view without adding another history entry.
 
 Car-to-car collisions remain server-authoritative: cars transfer motion and lose
 speed on impact. Browser and console prediction also collide with the full rotated
-opponent hulls at their displayed positions, including on tracks without walls.
-Remote cars are updated first; local render interpolation is constrained against
+opponent hulls, including on tracks without walls. For collisions, opponents are
+extrapolated from their newest snapshot to the moment your predicted car represents
+(about one round trip ahead); local render interpolation is constrained against
 those hulls so smoothing cannot draw your car through another between physics ticks.
 The debug panel's **Collisions** section separates wall and car contact counters.
 Opponent bodies are removed when players leave and reset with prediction on respawn
@@ -238,6 +239,34 @@ new countdown automatically.
 - When validating movement, hold **ArrowUp** across track boundaries and repeat
   after **Play Again** and leaving/rejoining. Normal driving should not trigger
   large backward jumps or `[SNAP]` corrections in the **B** debug overlay.
+
+### Networking, Prediction and Reconciliation
+
+- Keyboard, touch and tilt controls only set the controls currently held. The
+  shared `PredictionEngine` (`shared/utils/predictionEngine.ts`, used by both
+  the browser and the console client) turns them into one numbered input per
+  60 Hz step, simulates it immediately, remembers the result and sends it.
+- The server queues each player's inputs and applies exactly one per physics
+  tick. When an input arrives late the previous one stays held, after which a
+  two-input jitter buffer refills; a backlog beyond 6 inputs (100 ms) is skipped.
+  Snapshots report the last input applied.
+- When a snapshot differs from what the client predicted for that input, the
+  client restarts from the authoritative state and replays the inputs the
+  server has not processed yet. Remaining differences are eased out of the
+  display over about 100 ms; teleports such as respawns are shown at once.
+  Latency therefore does not delay or pull back your own car.
+- **R** sends a single respawn request with the next input. When controls are
+  released because the page is hidden, one input is sent immediately because
+  hidden pages pause the render loop that normally sends inputs.
+- Other cars are drawn from timestamped snapshots 100 ms in the past
+  (`shared/utils/snapshotInterpolation.ts`), interpolating between server
+  states instead of chasing the newest one.
+- Prediction keeps only walls within 600 px of the car in its collision world,
+  so prediction and replays cost the same on every track size.
+- `tests/networkLatency.test.ts` drives the real server room and client
+  prediction over simulated 0–250 ms round trips with jitter. The **B** overlay
+  shows **Prediction replays**; during normal driving it should only increase
+  around contacts.
 
 ### Start Grid and AI Players
 
@@ -432,7 +461,7 @@ The `deploy-to-azure.ps1` script automatically:
 - ✅ Creates optimized deployment package (removes devDependencies)
 - ✅ Includes Git-tracked circuit JSON files from `data/tracks`, excluding local
   custom tracks, leaderboards and replays
-- ✅ Configures App Service settings for Node.js
+- ✅ Configures App Service settings for Node.js and enables Web sockets
 - ✅ Deploys using Azure App Service deployment API
 - ✅ Provides useful post-deployment commands
 - ✅ Handles cleanup of temporary files
@@ -503,6 +532,11 @@ The deployment script automatically sets these App Service settings:
 SCM_DO_BUILD_DURING_DEPLOYMENT=true
 NODE_ENV=production
 ```
+
+It also enables **Web sockets** (`az webapp config set --web-sockets-enabled true`),
+which the game uses for one long-lived Socket.IO connection per player. Room and race
+state live in the server process, so run a single instance. Racing runs physics at
+60 Hz per room; a dedicated plan avoids stalls caused by other apps sharing its CPU.
 
 ## 🎮 How to Play
 

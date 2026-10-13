@@ -30,6 +30,12 @@ const BOT_NAMES = [
   'Turbo Bot', 'Apex Bot', 'Nitro Bot', 'Drift Bot',
   'Redline Bot', 'Chicane Bot', 'Piston Bot', 'Slipstream Bot',
 ];
+// Inputs beyond this many ticks (100 ms) behind are skipped instead of delaying the car.
+const MAX_INPUT_BACKLOG = 6;
+// After running dry, resume once this many inputs are queued or this many ticks have passed.
+const INPUT_JITTER_BUFFER = 2;
+// Hard cap on buffered inputs per player between ticks.
+const MAX_INPUT_QUEUE = 60;
 
 type RoomEventListener = (event: string, data: unknown) => void;
 
@@ -62,6 +68,9 @@ export class GameRoom {
   private stateSequence: number = 0;
 
   private botDrivers: Map<string, BotDriver> = new Map();
+  private inputQueues: Map<string, PlayerInput[]> = new Map();
+  /** Players whose queue ran dry, with the ticks spent refilling it. */
+  private inputWaitTicks: Map<string, number> = new Map();
   private racingLine: RacingLine | null = null;
   private racingLineRequested = false;
 
@@ -309,6 +318,8 @@ export class GameRoom {
 
     this.players.delete(playerId);
     this.cars.delete(playerId);
+    this.inputQueues.delete(playerId);
+    this.inputWaitTicks.delete(playerId);
     this.botDrivers.delete(playerId);
     this.physics.removeCar(playerId);
 
@@ -436,21 +447,69 @@ export class GameRoom {
   }
 
   // Input handling
+  /**
+   * Inputs are queued and applied one per physics tick, exactly as the client predicted them,
+   * so network jitter cannot stretch or shorten how long a control was held.
+   */
   handleInput(playerId: string, input: PlayerInput): void {
     // Allow input during countdown (for immediate response when race starts) and racing
     if (this.state !== 'countdown' && this.state !== 'racing') return;
 
     const car = this.cars.get(playerId);
-    if (!car) return;
+    if (!car || !input || !Number.isFinite(input.sequence)) return;
 
-    // Handle manual respawn request
-    if (input.respawn) {
-      this.handleRespawn(playerId);
-      return;
+    let queue = this.inputQueues.get(playerId);
+    if (!queue) {
+      queue = [];
+      this.inputQueues.set(playerId, queue);
+      // Build a small jitter buffer before the first input is applied.
+      this.inputWaitTicks.set(playerId, 0);
     }
-
-    this.physics.applyInput(playerId, input);
+    const newest = queue[queue.length - 1]?.sequence ?? car.lastInputSequence;
+    if (input.sequence <= newest && input.sequence > 0) return;
+    if (this.state === 'countdown') {
+      // Only the controls held when the race starts matter.
+      queue.length = 0;
+    }
+    queue.push(input);
+    if (queue.length > MAX_INPUT_QUEUE) this.dropQueuedInputs(queue, queue.length - MAX_INPUT_QUEUE);
     this.lastActivity = Date.now();
+  }
+
+  /** Discards the oldest inputs, keeping a one-shot respawn request alive. */
+  private dropQueuedInputs(queue: PlayerInput[], count: number): void {
+    const dropped = queue.splice(0, count);
+    if (dropped.some(input => input.respawn) && queue[0]) queue[0] = { ...queue[0], respawn: true };
+  }
+
+  /**
+   * Applies the next queued input of each human player for this tick. When none arrived in
+   * time the previous input stays held, and the queue then refills a little before resuming so
+   * normal network jitter does not keep starving it. A backlog beyond the jitter allowance is
+   * skipped so delayed inputs never add permanent latency.
+   */
+  private applyQueuedInputs(): void {
+    for (const [playerId, queue] of this.inputQueues) {
+      if (queue.length > MAX_INPUT_BACKLOG) {
+        this.dropQueuedInputs(queue, queue.length - MAX_INPUT_BACKLOG);
+      }
+      const waited = this.inputWaitTicks.get(playerId);
+      if (waited !== undefined) {
+        if (queue.length === 0) continue;
+        if (queue.length < INPUT_JITTER_BUFFER && waited + 1 < INPUT_JITTER_BUFFER) {
+          this.inputWaitTicks.set(playerId, waited + 1);
+          continue;
+        }
+        this.inputWaitTicks.delete(playerId);
+      }
+      const input = queue.shift();
+      if (!input) {
+        this.inputWaitTicks.set(playerId, 0);
+        continue;
+      }
+      if (input.respawn) this.handleRespawn(playerId);
+      this.physics.applyInput(playerId, input);
+    }
   }
 
   // Game update
@@ -467,6 +526,7 @@ export class GameRoom {
     while (this.physicsAccumulator >= GAME_CONSTANTS.PHYSICS_DELTA && this.state === 'racing') {
       this.physicsAccumulator -= GAME_CONSTANTS.PHYSICS_DELTA;
       this.driveBots();
+      this.applyQueuedInputs();
       const events = this.physics.update(GAME_CONSTANTS.PHYSICS_DELTA / 1000);
       for (const event of events) {
         this.handlePhysicsEvent(event);
@@ -532,7 +592,8 @@ export class GameRoom {
 
   private handleLapComplete(playerId: string, lap: number, _lapTime: number): void {
     const car = this.cars.get(playerId);
-    if (!car) return;
+    // Cars that keep driving after the flag (e.g. AI players) must not finish again.
+    if (!car || car.finished) return;
 
     car.lap = lap;
     car.checkpoint = 0;
@@ -569,7 +630,7 @@ export class GameRoom {
   private handlePlayerFinish(playerId: string, position: number, totalTime: number): void {
     const car = this.cars.get(playerId);
     const player = this.players.get(playerId);
-    if (!car || !player) return;
+    if (!car || !player || car.finished) return;
 
     car.finished = true;
     car.finishTime = totalTime;
@@ -755,6 +816,8 @@ export class GameRoom {
 
     this.cars.clear();
     this.botDrivers.clear();
+    this.inputQueues.clear();
+    this.inputWaitTicks.clear();
     this.results = [];
     this.pendingEvents = [];
     this.startedAt = 0;

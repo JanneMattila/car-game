@@ -5,12 +5,20 @@ import {
   deserializeCarState,
   InputState,
   DEFAULT_INPUT_STATE,
-  RENDER_CONSTANTS,
-  PHYSICS_CONSTANTS,
+  INTERPOLATION_DELAY_MS,
+  PredictionOpponent,
+  ServerClock,
+  SnapshotInterpolator,
 } from '@shared';
 import { useNetworkStore } from './networkStore';
-import { vec2Lerp, lerpAngle, vec2Distance } from '@shared';
 import { reconcileWithServer, initializePrediction, clearPrediction, predictFrame, setPredictionTrack, setPredictionOpponents } from '../game/clientPrediction';
+
+// Opponent collisions are predicted at most this far ahead of the newest snapshot.
+const MAX_OPPONENT_LEAD_MS = 250;
+
+// Remote cars are rendered from timestamped snapshots, slightly in the past.
+const remoteMotion = new SnapshotInterpolator();
+const serverClock = new ServerClock();
 
 interface InterpolatedCar extends CarState {
   targetPosition: { x: number; y: number };
@@ -88,8 +96,10 @@ export const useGameStore = create<GameState>((set, get) => ({
 
   updateFromServer: (snapshot) => {
     setPredictionTrack(useNetworkStore.getState().track);
-    const { cars: currentCars, localPlayerId, inputSequence } = get();
+    const { cars: currentCars, localPlayerId } = get();
     const newCars = new Map<string, InterpolatedCar>();
+    serverClock.observe(snapshot.timestamp);
+    remoteMotion.retain(new Set(snapshot.cars.map(car => car.playerId)));
 
     for (const carSnapshot of snapshot.cars) {
       const existingCar = currentCars.get(carSnapshot.playerId);
@@ -144,21 +154,22 @@ export const useGameStore = create<GameState>((set, get) => ({
       }
 
       const serverPos = carState.position;
-
-      const shouldSnap = existingCar 
-        ? vec2Distance(existingCar.displayPosition, serverPos) > RENDER_CONSTANTS.TELEPORT_THRESHOLD
-        : true;
+      remoteMotion.push(carSnapshot.playerId, {
+        time: snapshot.timestamp,
+        x: serverPos.x,
+        y: serverPos.y,
+        rotation: carState.rotation,
+        vx: carState.velocity.x,
+        vy: carState.velocity.y,
+        angularVelocity: carState.angularVelocity ?? 0,
+      });
 
       const interpolatedCar: InterpolatedCar = {
         ...carState,
         targetPosition: { ...serverPos },
         targetRotation: carState.rotation,
-        displayPosition: shouldSnap 
-          ? { ...serverPos }
-          : existingCar?.displayPosition ?? { ...serverPos },
-        displayRotation: shouldSnap
-          ? carState.rotation
-          : existingCar?.displayRotation ?? carState.rotation,
+        displayPosition: existingCar?.displayPosition ?? { ...serverPos },
+        displayRotation: existingCar?.displayRotation ?? carState.rotation,
       };
 
       newCars.set(carSnapshot.playerId, interpolatedCar);
@@ -203,58 +214,48 @@ export const useGameStore = create<GameState>((set, get) => ({
 
   interpolate: (deltaTime) => {
     const { cars, localPlayerId } = get();
-    const lerpFactor = RENDER_CONSTANTS.POSITION_LERP_FACTOR;
-    const rotationLerpFactor = RENDER_CONSTANTS.ROTATION_LERP_FACTOR;
-
     const updatedCars = new Map<string, InterpolatedCar>();
 
     // Clamp deltaTime to prevent issues with large time gaps
     const clampedDeltaTime = Math.min(deltaTime, 0.1); // Max 100ms
+    const synchronized = serverClock.synchronized;
+    const renderTime = serverClock.serverTime() - INTERPOLATION_DELAY_MS;
+    // The local car is predicted about one round trip ahead of the newest snapshot, so
+    // opponents are extrapolated to the same moment for collision prediction.
+    const opponentTime = serverClock.serverTime() + 2 * useNetworkStore.getState().latency;
+    const opponents: PredictionOpponent[] = [];
 
     for (const [playerId, car] of cars) {
       if (playerId === localPlayerId) continue;
-      
-      // Validate existing values for remote players
-      if (!Number.isFinite(car.displayPosition.x) || !Number.isFinite(car.displayPosition.y)) {
-        console.error('Invalid displayPosition detected, resetting to target:', playerId, car.displayPosition);
-        car.displayPosition = { ...car.targetPosition };
-      }
-      if (!Number.isFinite(car.targetPosition.x) || !Number.isFinite(car.targetPosition.y)) {
-        console.error('Invalid targetPosition detected:', playerId, car.targetPosition);
-        continue;
-      }
 
-      const newDisplayPosition = vec2Lerp(
-        car.displayPosition,
-        car.targetPosition,
-        Math.min(1, lerpFactor * clampedDeltaTime * 60)
-      );
+      const shown = synchronized ? remoteMotion.sample(playerId, renderTime) : null;
+      const ahead = synchronized
+        ? remoteMotion.sample(playerId, opponentTime, MAX_OPPONENT_LEAD_MS)
+        : null;
+      const displayPosition = shown && Number.isFinite(shown.position.x) && Number.isFinite(shown.position.y)
+        ? shown.position
+        : car.displayPosition;
+      const displayRotation = shown && Number.isFinite(shown.rotation)
+        ? shown.rotation
+        : car.displayRotation;
 
-      const newDisplayRotation = lerpAngle(
-        car.displayRotation,
-        car.targetRotation,
-        Math.min(1, rotationLerpFactor * clampedDeltaTime * 60)
-      );
-
-      const finalPosition = (Number.isFinite(newDisplayPosition.x) && Number.isFinite(newDisplayPosition.y))
-        ? newDisplayPosition
-        : car.targetPosition;
-
-      updatedCars.set(playerId, {
-        ...car,
-        displayPosition: finalPosition,
-        displayRotation: Number.isFinite(newDisplayRotation) ? newDisplayRotation : car.targetRotation,
+      updatedCars.set(playerId, { ...car, displayPosition, displayRotation });
+      opponents.push(ahead ? { playerId, ...ahead } : {
+        playerId,
+        position: displayPosition,
+        rotation: displayRotation,
+        velocity: car.velocity,
+        angularVelocity: car.angularVelocity ?? 0,
       });
     }
 
     setPredictionTrack(useNetworkStore.getState().track);
-    setPredictionOpponents([...updatedCars.values()].map(car => ({
-      ...car, position: car.displayPosition, rotation: car.displayRotation,
-    })));
+    setPredictionOpponents(opponents);
     const localCar = localPlayerId ? cars.get(localPlayerId) : null;
     if (localCar && localPlayerId) {
       const predicted = useNetworkStore.getState().room?.state === 'racing'
-        ? predictFrame(clampedDeltaTime) : null;
+        ? predictFrame(clampedDeltaTime, input => useNetworkStore.getState().sendPredictionInput(input))
+        : null;
       updatedCars.set(localPlayerId, predicted ? {
         ...localCar,
         displayPosition: { x: predicted.x, y: predicted.y },
@@ -343,6 +344,8 @@ export const useGameStore = create<GameState>((set, get) => ({
 
   reset: () => {
     clearPrediction();
+    remoteMotion.clear();
+    serverClock.reset();
     set({
       cars: new Map(),
       currentInput: { ...DEFAULT_INPUT_STATE },

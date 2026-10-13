@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { io, Socket } from 'socket.io-client';
 import { useGameStore } from './gameStore';
 import { debugLogger } from '../utils/debugLogger';
-import { resetPredictionVelocity } from '../game/clientPrediction';
+import { handlePredictionRespawn } from '../game/clientPrediction';
 import {
   ServerMessage,
   ClientMessage,
@@ -19,6 +19,7 @@ import {
   DEFAULT_INPUT_STATE,
   PlayerInput,
   BotDifficulty,
+  PredictionInput,
 } from '@shared';
 
 interface NetworkState {
@@ -60,6 +61,7 @@ interface NetworkState {
   
   // In-game actions
   sendInput: (input: InputState) => void;
+  sendPredictionInput: (input: PredictionInput) => void;
   sendChat: (message: string) => void;
   sendEmote: (emote: import('@shared').EmoteType) => void;
   
@@ -217,6 +219,27 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     };
     
     get().send({ type: 'input', input: playerInput });
+  },
+
+  sendPredictionInput: (input) => {
+    const { playerId } = get();
+    if (!playerId) return;
+    get().send({
+      type: 'input',
+      input: {
+        playerId,
+        sequence: input.sequence,
+        timestamp: input.timestamp,
+        accelerate: input.accelerate,
+        brake: input.brake,
+        steerLeft: input.steerLeft,
+        steerRight: input.steerRight,
+        steerValue: input.steerValue,
+        nitro: input.nitro,
+        handbrake: input.handbrake,
+        respawn: !!input.respawn,
+      },
+    });
   },
 
   sendChat: (message) => {
@@ -462,8 +485,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
             const localId = get().playerId;
             for (const event of message.state.events) {
               if (event.type === 'respawn' && event.playerId === localId) {
-                // Reset client-side prediction velocity
-                resetPredictionVelocity();
+                // Reconciliation already placed the car; drop contacts from the old location.
+                handlePredictionRespawn();
                 
                 // Show overlay only if not already showing
                 if (!respawning) {

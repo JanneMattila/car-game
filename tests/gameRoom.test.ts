@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
-import { DEFAULT_GAME_SETTINGS, DEFAULT_INPUT_STATE, GAME_CONSTANTS, type Track } from '../shared/index';
+import { DEFAULT_GAME_SETTINGS, DEFAULT_INPUT_STATE, GAME_CONSTANTS, type GameEvent, type Track } from '../shared/index';
 import { GameRoom } from '../server/game/gameRoom';
 import { LeaderboardManager } from '../server/leaderboards/leaderboardManager';
 import { StorageService } from '../server/storage/storageService';
@@ -129,6 +129,36 @@ test('rematches still require ready players and preserve results on rejected sta
   assert.equal(room.startGame(), true);
 });
 
+test('a car that keeps lapping after the flag does not finish again or delay the race end', t => {
+  const room = createRoom(t);
+  room.addPlayer('guest', 'Guest', 'red');
+  room.setPlayerReady('host', true);
+  room.setPlayerReady('guest', true);
+  assert.equal(room.startGame(), true);
+  for (let i = 0; i < GAME_CONSTANTS.COUNTDOWN_SECONDS; i++) t.mock.timers.tick(1000);
+  t.mock.timers.tick(500);
+  room.handleInput('host', {
+    ...DEFAULT_INPUT_STATE, accelerate: true, sequence: 1, timestamp: Date.now(),
+  });
+  for (let frame = 0; frame < 180 && !room.getCar('host')!.finished; frame++) {
+    t.mock.timers.tick(GAME_CONSTANTS.PHYSICS_DELTA);
+  }
+  const finishTime = room.getCar('host')!.finishTime;
+  assert.ok(finishTime > 0);
+
+  // AI players keep driving and cross the finish line again after finishing.
+  t.mock.timers.tick(10000);
+  (room as unknown as { handlePhysicsEvent(event: GameEvent): void }).handlePhysicsEvent({
+    type: 'lap', playerId: 'host', lap: 2, time: 0,
+  });
+  assert.equal(room.getCar('host')!.finishTime, finishTime);
+  assert.equal(room.getResults().length, 1);
+  assert.deepEqual(room.getGameState().finishedPlayers, ['host']);
+
+  t.mock.timers.tick(GAME_CONSTANTS.FINISH_GRACE_PERIOD - 10000 + 1000);
+  assert.equal(room.getState(), 'results', 'the grace period counts from the first finish');
+});
+
 function startDrivingRace(t: TestContext, keepCheckpoint = false) {
   const room = createRoom(t, false, keepCheckpoint);
   room.setPlayerReady('host', true);
@@ -154,9 +184,11 @@ function startDrivingRace(t: TestContext, keepCheckpoint = false) {
 test('respawning after long-distance driving stays near the current world tile', t => {
   const room = startDrivingRace(t, true);
   for (let frame = 0; frame < 1200; frame++) t.mock.timers.tick(GAME_CONSTANTS.PHYSICS_DELTA);
+  room.handleInput('host', { ...DEFAULT_INPUT_STATE, sequence: 2, timestamp: Date.now() });
+  // Queued controls take effect within the server's two-tick jitter buffer.
+  t.mock.timers.tick(GAME_CONSTANTS.PHYSICS_DELTA * 3);
   const before = { ...room.getCar('host')!.position };
   assert.ok(before.y < -10000);
-  room.handleInput('host', { ...DEFAULT_INPUT_STATE, sequence: 2, timestamp: Date.now() });
   room.handleRespawn('host');
   const expected = { x: 150, y: 100 + Math.round((before.y - 100) / 600) * 600 };
   assert.deepEqual(room.getCar('host')!.position, expected);

@@ -143,6 +143,13 @@ az webapp config appsettings set `
     --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true NODE_ENV=production `
     --output none
 
+# Real-time racing uses a long-lived WebSocket per player (Socket.IO websocket transport).
+az webapp config set `
+    --resource-group $ResourceGroup `
+    --name $AppName `
+    --web-sockets-enabled true `
+    --output none
+
 # Build the application
 if (-not $SkipBuild) {
     Write-Step "Building application..."

@@ -2,7 +2,7 @@ import { useEffect, useCallback, useRef } from 'react';
 import { useGameStore } from '../store/gameStore';
 import { useNetworkStore } from '../store/networkStore';
 import { InputState, DEFAULT_INPUT_STATE } from '@shared';
-import { recordInput } from './clientPrediction';
+import { flushInputStep, requestRespawn, setCurrentInput } from './clientPrediction';
 
 /** Returns true when the race is actively running (not countdown, not waiting, etc.) */
 function isRacing(): boolean {
@@ -10,22 +10,35 @@ function isRacing(): boolean {
   return room?.state === 'racing';
 }
 
-let inputSequence = 0;
+/**
+ * Every input device (keyboard, touch, tilt) reports the controls it currently holds here.
+ * Prediction turns the held controls into one numbered input per 60 Hz physics step, simulates
+ * it locally and sends it to the server, so all devices get the same responsive handling.
+ */
+function applyControls(input: InputState): void {
+  useGameStore.getState().setInput(input);
+  setCurrentInput(input);
+}
+
+/** Re-applies held controls when the race starts, since no new key/touch event may occur. */
+function useReapplyOnRaceStart(apply: () => void): void {
+  const applyRef = useRef(apply);
+  applyRef.current = apply;
+  const roomState = useNetworkStore(state => state.room?.state);
+  useEffect(() => {
+    if (roomState === 'racing') applyRef.current();
+  }, [roomState]);
+}
 
 export function useKeyboardInput() {
-  const { sendInput } = useNetworkStore();
-  const { setInput } = useGameStore();
-  const updateInputRef = useRef<() => void>();
   const keys = useRef<Record<string, boolean>>({});
 
   const updateInput = useCallback(() => {
     const keyState = keys.current;
     const steerLeft = keyState['KeyA'] || keyState['ArrowLeft'] || false;
     const steerRight = keyState['KeyD'] || keyState['ArrowRight'] || false;
-    
-    inputSequence++;
-    
-    const input: InputState = {
+
+    applyControls({
       ...DEFAULT_INPUT_STATE,
       accelerate: keyState['KeyW'] || keyState['ArrowUp'] || false,
       brake: keyState['KeyS'] || keyState['ArrowDown'] || false,
@@ -38,44 +51,11 @@ export function useKeyboardInput() {
       boost: keyState['Space'] || keyState['ShiftLeft'] || false, // Alias
       handbrake: keyState['KeyX'] || false,
       respawn: keyState['KeyR'] || false,
-      sequenceNumber: inputSequence,
-    };
-
-    setInput(input);
-
-    // Only send movement inputs when the race is actively running
-    if (!isRacing()) return;
-
-    sendInput(input);
-    
-    // Record input for server reconciliation
-    // The render loop's predictFrame() handles all physics stepping —
-    // we do NOT do prediction here to avoid double-step jitter.
-    recordInput({
-      sequence: inputSequence,
-      timestamp: Date.now(),
-      accelerate: input.accelerate,
-      brake: input.brake,
-      steerLeft: input.steerLeft,
-      steerRight: input.steerRight,
-      steerValue: input.steerValue,
-      nitro: input.nitro,
-      handbrake: input.handbrake,
     });
-  }, [setInput, sendInput]);
+  }, []);
 
-  // Keep a stable ref so the racing-start effect can call it
-  updateInputRef.current = updateInput;
-
-  // When the room transitions to 'racing', re-evaluate and send the current
-  // key state. This fixes the bug where holding a key BEFORE the countdown
-  // ends never triggers a new keydown event, so the input is never sent.
-  const roomState = useNetworkStore(state => state.room?.state);
-  useEffect(() => {
-    if (roomState === 'racing') {
-      updateInputRef.current?.();
-    }
-  }, [roomState]);
+  // Holding a key before the countdown ends never triggers a new keydown event.
+  useReapplyOnRaceStart(updateInput);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -85,6 +65,7 @@ export function useKeyboardInput() {
       const code = e.code;
       if (!keys.current[code]) {
         keys.current[code] = true;
+        if (code === 'KeyR' && isRacing()) requestRespawn();
         updateInput();
       }
     };
@@ -100,6 +81,9 @@ export function useKeyboardInput() {
     const releaseKeys = () => {
       keys.current = {};
       updateInput();
+      if (isRacing()) {
+        flushInputStep(input => useNetworkStore.getState().sendPredictionInput(input));
+      }
     };
     const handleVisibilityChange = () => {
       if (document.hidden) releaseKeys();
@@ -118,22 +102,6 @@ export function useKeyboardInput() {
       releaseKeys();
     };
   }, [updateInput]);
-
-  // --- Continuous input sending at physics tick rate ---
-  // The server runs physics at 60Hz using the most recent input.
-  // Sending input only on key-change means the server might process
-  // stale input for many ticks. A low-rate polling loop ensures the
-  // server always has fresh state AND gives proper sequence numbers
-  // that align with prediction ticks for accurate reconciliation.
-  useEffect(() => {
-    const TICK_MS = 1000 / 20; // 20Hz is enough to keep server in sync
-    const id = setInterval(() => {
-      if (!isRacing()) return;
-      // Re-send current key state (updateInput increments sequence)
-      updateInputRef.current?.();
-    }, TICK_MS);
-    return () => clearInterval(id);
-  }, []);
 }
 
 // Touch controls state
@@ -158,14 +126,11 @@ const touchState: TouchState = {
 };
 
 export function useTouchInput() {
-  const { sendInput } = useNetworkStore();
-  const { setInput } = useGameStore();
-
   const updateTouchInput = useCallback(() => {
     const steerLeft = touchState.activeLeft;
     const steerRight = touchState.activeRight;
-    
-    const input: InputState = {
+
+    applyControls({
       ...DEFAULT_INPUT_STATE,
       accelerate: touchState.accelerate !== null,
       brake: touchState.brake !== null,
@@ -178,12 +143,10 @@ export function useTouchInput() {
       boost: false,
       handbrake: false,
       respawn: false,
-      sequenceNumber: Date.now(),
-    };
+    });
+  }, []);
 
-    setInput(input);
-    sendInput(input);
-  }, [setInput, sendInput]);
+  useReapplyOnRaceStart(updateTouchInput);
 
   // Check if device supports touch
   useEffect(() => {
@@ -229,9 +192,6 @@ export function useTouchInput() {
 
 // Tilt-to-steer using device orientation
 export function useTiltInput(enabled: boolean = false) {
-  const { sendInput } = useNetworkStore();
-  const { setInput, currentInput } = useGameStore();
-
   useEffect(() => {
     if (!enabled) return;
 
@@ -251,18 +211,15 @@ export function useTiltInput(enabled: boolean = false) {
         const steerLeft = normalizedTilt < -threshold / maxTilt;
         const steerRight = normalizedTilt > threshold / maxTilt;
 
-        const input: InputState = {
-          ...currentInput,
+        // Merge with the throttle/brake currently held on the touch controls.
+        applyControls({
+          ...useGameStore.getState().currentInput,
           steerLeft,
           steerRight,
           turnLeft: steerLeft,  // Alias
           turnRight: steerRight, // Alias
-          steerValue: normalizedTilt,
-          sequenceNumber: Date.now(),
-        };
-
-        setInput(input);
-        sendInput(input);
+          steerValue: steerLeft || steerRight ? normalizedTilt : 0,
+        });
       }
     };
 
@@ -282,5 +239,5 @@ export function useTiltInput(enabled: boolean = false) {
     return () => {
       window.removeEventListener('deviceorientation', handleOrientation);
     };
-  }, [enabled, setInput, sendInput, currentInput]);
+  }, [enabled]);
 }

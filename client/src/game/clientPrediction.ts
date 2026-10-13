@@ -1,494 +1,97 @@
-// Client-side prediction with server reconciliation
-// Provides smooth movement by predicting locally and correcting when server responds
+// Browser-side prediction state: one PredictionEngine for the local car.
+// The engine itself lives in shared/ so the console client runs identical code.
 
-import { PHYSICS_CONSTANTS, getSteeringInput, Track, WallPredictionWorld, stepNitro, RoadSurfaceIndex, drivingResistance, PredictionOpponent } from '@shared';
+import {
+  PredictionEngine,
+  type PredictedState,
+  type PredictionControls,
+  type PredictionInput,
+  type PredictionOpponent,
+  type ReconciliationDebugInfo,
+  type Track,
+} from '@shared';
 
-interface PredictedState {
-  x: number;
-  y: number;
-  rotation: number;
-  vx: number;
-  vy: number;
-  angularVelocity: number;
-  /** Omitted only by legacy callers starting with a full tank. */
-  nitroAmount?: number;
-  layer?: number;
-}
+export type { PredictedState, PredictionControls, PredictionInput, ReconciliationDebugInfo };
 
-interface InputRecord {
-  sequence: number;
-  timestamp: number;
-  accelerate: boolean;
-  brake: boolean;
-  steerLeft: boolean;
-  steerRight: boolean;
-  steerValue: number;
-  nitro: boolean;
-  handbrake: boolean;
-}
-
-// Store pending inputs that haven't been confirmed by server
-const pendingInputs: InputRecord[] = [];
-let lastConfirmedSequence = 0;
-let predictedState: PredictedState | null = null;
-let currentInput: InputRecord | null = null; // Current held input for continuous simulation
-let physicsAccumulator = 0; // Accumulates real time, drained in fixed DELTA_TIME steps
-let previousState: PredictedState | null = null; // Previous physics state for render interpolation
-let predictionTrack: Track | null = null;
-let wallWorld: WallPredictionWorld | null = null;
-let roadSurface: RoadSurfaceIndex | null = null;
-
-// Debug telemetry – readable by the debug overlay
-export interface ReconciliationDebugInfo {
-  lastCorrectionDist: number;
-  lastCorrectionX: number;
-  lastCorrectionY: number;
-  lastVelocityDeltaX: number;
-  lastVelocityDeltaY: number;
-  lastRotationDelta: number;
-  snapped: boolean;
-  serverUpdateCount: number;
-  lastServerUpdateTime: number;
-  wallContacts: number;
-  wallCollisionSteps: number;
-  carContacts: number;
-  carCollisionSteps: number;
-}
-
-const _debugInfo: ReconciliationDebugInfo = {
-  lastCorrectionDist: 0,
-  lastCorrectionX: 0,
-  lastCorrectionY: 0,
-  lastVelocityDeltaX: 0,
-  lastVelocityDeltaY: 0,
-  lastRotationDelta: 0,
-  snapped: false,
-  serverUpdateCount: 0,
-  lastServerUpdateTime: 0,
-  wallContacts: 0,
-  wallCollisionSteps: 0,
-  carContacts: 0,
-  carCollisionSteps: 0,
-};
+const engine = new PredictionEngine();
 
 /** Get reconciliation debug info (read-only snapshot) */
 export function getReconciliationDebug(): Readonly<ReconciliationDebugInfo> {
-  return _debugInfo;
+  return engine.debug;
 }
 
 export function setPredictionTrack(track: Track | null, reset = false): void {
-  if (predictionTrack === track && !reset) return;
-  wallWorld?.dispose();
-  predictionTrack = track;
-  roadSurface = track ? new RoadSurfaceIndex(track) : null;
-  wallWorld = track ? new WallPredictionWorld(track) : null;
-  _debugInfo.wallContacts = 0;
-  _debugInfo.carContacts = 0;
+  engine.setTrack(track, reset);
 }
 
 export function setPredictionOpponents(cars: readonly PredictionOpponent[]): void {
-  if (!wallWorld && cars.length > 0) wallWorld = new WallPredictionWorld(predictionTrack);
-  wallWorld?.setOpponents(cars);
-  _debugInfo.carContacts = wallWorld?.carContacts ?? 0;
+  engine.setOpponents(cars);
 }
 
-// Physics constants for local prediction (simplified)
-const DELTA_TIME = 1 / 60; // 60fps physics
-const MAX_PENDING_INPUTS = 120; // ~2 seconds at 60fps
-
-// Helper functions
-function vec2Length(x: number, y: number): number {
-  return Math.sqrt(x * x + y * y);
+/** Controls currently held by the player (keyboard, touch or tilt). */
+export function setCurrentInput(controls: PredictionControls): void {
+  engine.setControls(controls);
 }
 
-/**
- * Set the current input state (called when input changes)
- */
-export function setCurrentInput(input: InputRecord): void {
-  currentInput = { ...input };
+/** Sends a respawn request with the next physics step's input. */
+export function requestRespawn(): void {
+  engine.requestRespawn();
 }
 
-/**
- * Record an input for later reconciliation
- */
-export function recordInput(input: InputRecord): void {
-  pendingInputs.push({ ...input });
-  currentInput = { ...input };
-  
-  // Trim old inputs to prevent memory growth
-  while (pendingInputs.length > MAX_PENDING_INPUTS) {
-    pendingInputs.shift();
-  }
-}
-
-/**
- * Apply local prediction for immediate responsiveness
- * Call this after recording input
- */
+/** Simulates one step from an explicit state. */
 export function predictLocalMovement(
   currentState: PredictedState,
-  input: InputRecord
+  input: PredictionControls
 ): PredictedState & { nitroAmount: number } {
-  const result = simulateStep(currentState, input);
-  predictedState = result;
-  return result;
+  return engine.predictLocalMovement(currentState, input);
 }
 
 /**
- * Run one frame of prediction using current held input.
- * Uses a fixed-timestep accumulator so physics always steps at 60 Hz
- * regardless of the display refresh rate.
- *
- * Returns a render-interpolated state for sub-frame smoothness:
- * after stepping, the remaining accumulator time is used to blend
- * between the previous and current physics state, eliminating the
- * stutter that occurs when render frames don't align with physics steps.
+ * Advances prediction in fixed 60 Hz steps, passing each step's input to `send`, and returns
+ * the render-interpolated state to display.
  */
-export function predictFrame(deltaTime: number = DELTA_TIME): PredictedState | null {
-  if (!predictedState || !currentInput) return predictedState;
-  
-  physicsAccumulator += deltaTime;
-  
-  // Step at a fixed rate; consume all accumulated time
-  while (physicsAccumulator >= DELTA_TIME) {
-    previousState = { ...predictedState };
-    predictedState = simulateStep(predictedState, currentInput);
-    physicsAccumulator -= DELTA_TIME;
-  }
-  
-  // Interpolate between previous and current physics state for smooth rendering.
-  // alpha = fraction of a physics step that has elapsed since the last step.
-  if (previousState && predictedState) {
-    const alpha = physicsAccumulator / DELTA_TIME;
-    const display = {
-      x: previousState.x + (predictedState.x - previousState.x) * alpha,
-      y: previousState.y + (predictedState.y - previousState.y) * alpha,
-      rotation: previousState.rotation + (predictedState.rotation - previousState.rotation) * alpha,
-      vx: predictedState.vx,
-      vy: predictedState.vy,
-      angularVelocity: predictedState.angularVelocity,
-      nitroAmount: predictedState.nitroAmount,
-      layer: predictedState.layer,
-    };
-    return wallWorld?.constrain(display) ?? display;
-  }
-  
-  return predictedState ? wallWorld?.constrain(predictedState) ?? predictedState : null;
+export function predictFrame(
+  deltaTime?: number,
+  send?: (input: PredictionInput) => void
+): PredictedState | null {
+  return engine.predictFrame(deltaTime, send);
 }
 
-/**
- * Simulate one physics step with given input.
- *
- * This MUST match the server's physics pipeline exactly to minimise
- * server-reconciliation correction distance.  The server does:
- *
- *   1. updateCar()  – accumulate forces via Matter.Body.applyForce(),
- *                     apply braking / drag / speed-clamp via setVelocity()
- *   2. Matter.Engine.update()  – Verlet integration with frictionAir
- *        v_new = v_prev × (1 – frictionAir × dt/baseDt)
- *              + (F / m) × dt²
- *
- * Key server constants baked in:
- *   body { 30×50 rect → mass = 1.2,
- *          frictionAir: 0.01, inertia: Infinity }
- *   Engine.update(engine, 1000/60)  → dt = baseDt → time-correction = 1
- */
-
-// ── Server-matching constants ──────────────────────────────────────
-const SERVER_BODY_MASS  = PHYSICS_CONSTANTS.CAR_BODY_MASS;
-const MATTER_DT         = 1000 / 60;     // ms – same as baseDelta
-const MATTER_DT_SQUARED = MATTER_DT * MATTER_DT; // ≈ 277.78
-const MATTER_FRICTION_AIR = 1 - 0.01;    // 0.99 – body.frictionAir = 0.01
-
-function simulateStep(state: PredictedState, input: InputRecord): PredictedState & { nitroAmount: number } {
-  let { x, y, rotation, vx, vy, angularVelocity } = state;
-  const nitro = stepNitro(state.nitroAmount ?? PHYSICS_CONSTANTS.NITRO_MAX, input.nitro, DELTA_TIME);
-  const resistance = drivingResistance(
-    roadSurface ? roadSurface.isAsphalt({ x, y }, state.layer ?? 0) : true,
-    wallWorld?.forceScale ?? 1
-  );
-
-  // Forward direction (same convention as server)
-  const forwardX = Math.sin(rotation);
-  const forwardY = -Math.cos(rotation);
-
-  // Speed measured at start of tick (matches server's `currentSpeed`)
-  const speed = vec2Length(vx, vy);
-  const forwardSpeed = vx * forwardX + vy * forwardY;
-  const isMovingForward  = forwardSpeed > 0.5;
-  const isMovingBackward = forwardSpeed < -0.5;
-
-  // ── 1. Accumulate forces (consumed in Verlet step below) ────────
-  let forceX = 0;
-  let forceY = 0;
-
-  // Acceleration – server: applyForce( rotate((0, -ENGINE_FORCE*0.001), angle) )
-  if (input.accelerate && speed < PHYSICS_CONSTANTS.MAX_SPEED) {
-    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001 * resistance.forceScale;
-    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.001 * resistance.forceScale;
-  }
-
-  // Nitro boost – server: applyForce( rotate((0, -ENGINE_FORCE*0.0015), angle) )
-  if (nitro.boostScale > 0) {
-    forceX += forwardX * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015 * nitro.boostScale * resistance.forceScale;
-    forceY += forwardY * PHYSICS_CONSTANTS.ENGINE_FORCE * 0.0015 * nitro.boostScale * resistance.forceScale;
-  }
-
-  // ── 2. Direct velocity modifications (setVelocity on server) ────
-
-  // Braking
-  if (input.brake) {
-    if (isMovingForward && forwardSpeed > 1) {
-      // Server: setVelocity(v * 0.95)
-      vx *= 0.95;
-      vy *= 0.95;
-    } else if (speed < PHYSICS_CONSTANTS.MAX_REVERSE_SPEED) {
-      // Server: reverse via applyForce
-      forceX -= forwardX * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001 * resistance.forceScale;
-      forceY -= forwardY * PHYSICS_CONSTANTS.REVERSE_FORCE * 0.001 * resistance.forceScale;
-    }
-  }
-
-  // ── 3. Steering (angular velocity) ─────────────────────────────
-  const steerInput = getSteeringInput(input);
-
-  if (steerInput !== 0) {
-    const minTurnSpeed = 0.5;
-    if (speed > minTurnSpeed) {
-      // Server's 3-tier speed factor
-      let speedFactor: number;
-      if (speed < 3) {
-        speedFactor = speed / 3;
-      } else if (speed < 15) {
-        speedFactor = 1.0;
-      } else {
-        speedFactor = Math.max(0.5, 15 / speed);
-      }
-      const turnForce = steerInput * PHYSICS_CONSTANTS.MAX_STEERING_ANGLE * 0.18 * speedFactor;
-      const reverseMult = isMovingBackward ? -1 : 1;
-      angularVelocity = turnForce * reverseMult;
-    }
-  } else {
-    // Server: setAngularVelocity(body.angularVelocity * 0.85)
-    angularVelocity *= 0.85;
-  }
-
-  // Server: angular velocity clamp
-  if (Math.abs(angularVelocity) > PHYSICS_CONSTANTS.MAX_ANGULAR_VELOCITY) {
-    angularVelocity = Math.sign(angularVelocity) * PHYSICS_CONSTANTS.MAX_ANGULAR_VELOCITY;
-  }
-
-  // ── 4. Drag (matches server: setVelocity *= (1 − drag·speed − rolling)) ─
-  const dragForce = PHYSICS_CONSTANTS.DRAG_COEFFICIENT * speed;
-  const rollingResistance = resistance.rollingResistance;
-  const dragFactor = 1 - dragForce - rollingResistance;
-  vx *= dragFactor;
-  vy *= dragFactor;
-
-  // ── 5. Speed clamp (server uses pre-drag `speed` for comparison) ─
-  const maxSpeed = resistance.speedScale * (nitro.boostScale > 0
-    ? PHYSICS_CONSTANTS.MAX_SPEED * PHYSICS_CONSTANTS.NITRO_BOOST_MULTIPLIER
-    : PHYSICS_CONSTANTS.MAX_SPEED);
-  if (speed > maxSpeed) {
-    const ratio = maxSpeed / speed;
-    vx *= ratio;
-    vy *= ratio;
-  }
-
-  // ── 6. Verlet integration (replaces Matter.js Body.update) ──────
-  // v = v_prev × frictionAir + (F / m) × dt²
-  vx = vx * MATTER_FRICTION_AIR + (forceX / SERVER_BODY_MASS) * MATTER_DT_SQUARED;
-  vy = vy * MATTER_FRICTION_AIR + (forceY / SERVER_BODY_MASS) * MATTER_DT_SQUARED;
-
-  // Angular: angVel × frictionAir  (torque / inertia = 0 due to Infinity inertia)
-  angularVelocity *= MATTER_FRICTION_AIR;
-  rotation += angularVelocity;
-
-  // ── 7. Position update ──────────────────────────────────────────
-  x += vx;
-  y += vy;
-
-  // Both server and client use continuous world coordinates.
-  const next = { x, y, rotation, vx, vy, angularVelocity };
-  const result = wallWorld ? wallWorld.resolve(state, next) : next;
-  _debugInfo.wallContacts = wallWorld?.contacts ?? 0;
-  if (_debugInfo.wallContacts > 0) _debugInfo.wallCollisionSteps++;
-  _debugInfo.carContacts = wallWorld?.carContacts ?? 0;
-  if (_debugInfo.carContacts > 0) _debugInfo.carCollisionSteps++;
-  return { ...result, nitroAmount: nitro.amount, layer: state.layer ?? 0 };
-}
-
-/**
- * Reconcile server state with client prediction.
- *
- * Instead of replaying individual inputs (which doesn't work well because
- * pendingInputs are key-change events, not per-tick entries), we use
- * smooth error correction:
- *  - Velocity & rotation: blended toward server to avoid jarring snaps
- *    while keeping future prediction on track.
- *  - Position: gently blended toward server to avoid visible jumps.
- *  - Large errors (e.g. respawn, teleport): hard snap.
- */
+/** Reconciles a server snapshot of the local car that includes inputs up to `serverSequence`. */
 export function reconcileWithServer(
   serverState: PredictedState,
   serverSequence: number
 ): PredictedState {
-  // Remove all inputs that have been processed by server
-  while (pendingInputs.length > 0 && pendingInputs[0]!.sequence <= serverSequence) {
-    pendingInputs.shift();
-  }
-  
-  lastConfirmedSequence = serverSequence;
-  
-  const target = serverState;
-  if (predictedState && target.layer !== undefined) predictedState.layer = target.layer;
-  if (predictedState && target.nitroAmount !== undefined) {
-    predictedState.nitroAmount = target.nitroAmount;
-  }
-  
-  // If no prior prediction, just accept server state
-  if (!predictedState) {
-    predictedState = { ...target, angularVelocity: target.angularVelocity ?? 0 };
-    _debugInfo.serverUpdateCount++;
-    _debugInfo.lastServerUpdateTime = performance.now();
-    _debugInfo.snapped = true;
-    _debugInfo.lastCorrectionDist = 0;
-    return predictedState;
-  }
-  
-  // --- Record debug deltas BEFORE correction ---
-  const dvx = target.vx - predictedState.vx;
-  const dvy = target.vy - predictedState.vy;
-  const rotDiff = Math.atan2(
-    Math.sin(target.rotation - predictedState.rotation),
-    Math.cos(target.rotation - predictedState.rotation)
-  );
-  const dx = target.x - predictedState.x;
-  const dy = target.y - predictedState.y;
-  const dist = Math.sqrt(dx * dx + dy * dy);
-  
-  _debugInfo.lastVelocityDeltaX = dvx;
-  _debugInfo.lastVelocityDeltaY = dvy;
-  _debugInfo.lastRotationDelta = rotDiff;
-  _debugInfo.lastCorrectionX = dx;
-  _debugInfo.lastCorrectionY = dy;
-  _debugInfo.lastCorrectionDist = dist;
-  _debugInfo.serverUpdateCount++;
-  _debugInfo.lastServerUpdateTime = performance.now();
-  
-  // --- Velocity: blend toward server (not hard snap) ---
-  // A gentle blend keeps prediction smooth while drifting toward authority.
-  const VEL_BLEND = 0.15; // 15 % correction per server update (~20 Hz)
-  predictedState.vx += dvx * VEL_BLEND;
-  predictedState.vy += dvy * VEL_BLEND;
-  
-  // --- Angular velocity: blend toward server ---
-  const serverAngVel = target.angularVelocity ?? 0;
-  const angVelDelta = serverAngVel - (predictedState.angularVelocity ?? 0);
-  predictedState.angularVelocity = (predictedState.angularVelocity ?? 0) + angVelDelta * VEL_BLEND;
-  
-  // --- Rotation: blend toward server ---
-  predictedState.rotation += rotDiff * 0.3;
-  
-  // --- Position: smooth correction ---
-  const SNAP_THRESHOLD = 150; // px  – respawn, stuck reset, etc.
-  const BLEND_FACTOR   = 0.1; // 10 % correction per server update (~20 Hz)
-  
-  if (dist > SNAP_THRESHOLD) {
-    wallWorld?.reset();
-    _debugInfo.wallContacts = 0;
-    _debugInfo.carContacts = 0;
-    // Large discrepancy – hard snap
-    predictedState.x = target.x;
-    predictedState.y = target.y;
-    predictedState.rotation = target.rotation;
-    predictedState.vx = target.vx;
-    predictedState.vy = target.vy;
-    predictedState.angularVelocity = target.angularVelocity ?? 0;
-    previousState = { ...predictedState }; // Reset interpolation base
-    _debugInfo.snapped = true;
-  } else if (dist > 0.5) {
-    // Gradual correction
-    predictedState.x += dx * BLEND_FACTOR;
-    predictedState.y += dy * BLEND_FACTOR;
-    previousState = null; // Let next predictFrame rebuild interpolation
-    _debugInfo.snapped = false;
-  } else {
-    _debugInfo.snapped = false;
-  }
-  // else: <0.5 px – no correction needed
-  
-  return predictedState;
+  return engine.reconcile(serverState, serverSequence);
 }
 
-/**
- * Get the current predicted state
- */
 export function getPredictedState(): PredictedState | null {
-  return predictedState;
+  return engine.getPredictedState();
 }
 
-/**
- * Initialize prediction with server state
- */
 export function initializePrediction(state: PredictedState, track: Track | null = null): void {
-  setPredictionTrack(null, true);
-  setPredictionTrack(track);
-  _debugInfo.wallCollisionSteps = 0;
-  _debugInfo.carCollisionSteps = 0;
-  predictedState = { ...state, angularVelocity: state.angularVelocity ?? 0 };
-  previousState = null;
-  pendingInputs.length = 0;
-  lastConfirmedSequence = 0;
-  physicsAccumulator = 0;
-  currentInput = {
-    sequence: 0,
-    timestamp: Date.now(),
-    accelerate: false,
-    brake: false,
-    steerLeft: false,
-    steerRight: false,
-    steerValue: 0,
-    nitro: false,
-    handbrake: false,
-  };
+  engine.initialize(state, track);
 }
 
-/**
- * Clear all prediction state
- */
 export function clearPrediction(): void {
-  setPredictionTrack(null, true);
-  _debugInfo.wallCollisionSteps = 0;
-  _debugInfo.carCollisionSteps = 0;
-  predictedState = null;
-  previousState = null;
-  pendingInputs.length = 0;
-  lastConfirmedSequence = 0;
-  currentInput = null;
-  physicsAccumulator = 0;
+  engine.clear();
 }
 
-/**
- * Reset prediction velocity to zero (used on respawn)
- * Keeps position but clears velocity and pending inputs
- */
-export function resetPredictionVelocity(): void {
-  wallWorld?.reset();
-  _debugInfo.wallContacts = 0;
-  _debugInfo.carContacts = 0;
-  if (predictedState) {
-    predictedState.vx = 0;
-    predictedState.vy = 0;
-    predictedState.angularVelocity = 0;
-  }
-  // Clear pending inputs since they contained old velocity
-  pendingInputs.length = 0;
+/** A confirmed respawn of the local car. */
+export function handlePredictionRespawn(): void {
+  engine.handleRespawn();
 }
 
-/**
- * Get count of pending inputs (for debugging)
- */
+/** Inputs sent but not yet acknowledged by the server. */
 export function getPendingInputCount(): number {
-  return pendingInputs.length;
+  return engine.getPendingInputCount();
+}
+
+/**
+ * Immediately simulates and sends one step with the held controls. Used when controls are
+ * released while the page is being hidden, because hidden pages stop the render loop that
+ * normally sends inputs and the server would otherwise keep the previous controls held.
+ */
+export function flushInputStep(send: (input: PredictionInput) => void): void {
+  engine.predictFrame(undefined, send);
 }
