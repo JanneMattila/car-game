@@ -324,6 +324,31 @@ Driving patterns apply when automatic driving is enabled (the default).
 Stop the console player with **Ctrl+C**. Run `npm test` for pattern and
 infinite-world physics and position regression tests.
 
+## 🖥️ Native Client and Dedicated Server
+
+As an alternative to playing in the browser, `native/` contains a Windows DirectX 11
+client and a C++ UDP game server (default port 5555). The server builds with Visual
+Studio and with g++, and runs in a container. The native client uses the web server's
+profile, track and lobby APIs. When the host starts a race, the web server launches a
+dedicated game server process for that match. The process already knows the players and
+the track. Clients connect over UDP with client-side prediction, server reconciliation
+and latency-adaptive input buffering. If the game server crashes or stops responding,
+players go back to the lobby.
+
+```powershell
+# Developer PowerShell for Visual Studio
+cmake -S native -B native\build\msvc -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build native\build\msvc
+ctest --test-dir native\build\msvc --output-on-failure
+npm run dev:server                      # finds native\build\msvc\cg_server.exe
+native\build\msvc\cg_client.exe
+node native/scripts/e2e.mjs             # end-to-end test with 2 AI clients and latency changes
+docker build -f native/Dockerfile -t car-game-server .
+```
+
+See [native/README.md](native/README.md) for controls, debug hotkeys (network overlay,
+live latency/jitter/loss simulation, autopilot), the protocol, configuration and testing.
+
 ## 📁 Project Structure
 
 ```
@@ -352,6 +377,7 @@ car-game/
 │   ├── constants/        # Game and physics constants
 │   ├── types/           # Interface definitions
 │   └── utils/           # Shared utility functions
+├── native/              # C++ DirectX client, UDP game server, bot and tests (CMake)
 ├── dist/                # Build output (generated)
 │   ├── client/          # Built client static files
 │   └── server/          # Built server files

@@ -6,6 +6,7 @@
 - [client/src](../client/src) contains the React UI, PixiJS renderer, client prediction, and Zustand state.
 - [server](../server) contains the Express API, Socket.IO handlers, race management, and Matter.js physics.
 - [shared](../shared) contains shared types, constants, and utilities. Keep network messages, track definitions, and physics behavior consistent across the server, browser client, and [console client](../console-client).
+- [native](../native) contains the C++ DirectX client, the UDP game server (MSVC and g++), a headless bot, and tests, built with CMake. Its physics in `native/common/physics.cpp` mirrors `shared` physics; keep both in sync. See [native/README.md](../native/README.md).
 - [data](../data) stores track JSON, leaderboards, and replays. Preserve existing data; do not change it incidentally during validation.
 - Read [README.md](../README.md) for setup and deployment details. For track editor work, consult the [track-editor skill](skills/track-editor/SKILL.md) and [track documentation](../track.md).
 
@@ -24,6 +25,7 @@
 - Build production artifacts with `npm run localbuild`, or use `npm run build:server` / `npm run build:client` for scoped changes. `npm run build` is intentionally a no-op, not a validation command.
 - Run `npm run lint` for code changes. Bundling does not type-check; use `npx tsc --noEmit -p tsconfig.json` and `npx tsc --noEmit -p client\tsconfig.json` for the affected code.
 - Run `npm test` for race lifecycle, delayed physics timer, and async renderer cleanup regression tests. Also validate affected gameplay in the browser, using multiple clients for multiplayer changes. [test-client.mjs](../test-client.mjs) is a specialized wrap-around diagnostic that requires a running server and its configured track, not a general test suite.
+- For native changes, build and run `ctest` in `native\build\msvc` from a Visual Studio developer environment. Run `node native/scripts/e2e.mjs` for the web server → game server → 2 AI bot flow. Build `docker build -f native/Dockerfile .` to check the g++ build and tests.
 - For UI changes, verify the affected screen in the browser. Documentation-only changes do not require starting the app or running builds.
 - Build output in `dist` is generated; edit source files instead.
 

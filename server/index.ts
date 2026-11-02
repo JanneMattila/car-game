@@ -14,6 +14,9 @@ import { TrackManager } from './tracks/trackManager.js';
 import { LeaderboardManager } from './leaderboards/leaderboardManager.js';
 import { StorageService } from './storage/storageService.js';
 import { createApiRoutes } from './routes/api.js';
+import { createNativeApiRoutes } from './routes/nativeApi.js';
+import { ProfileManager } from './profiles/profileManager.js';
+import { NativeMatchManager, nativeOptionsFromEnv } from './native/nativeMatchManager.js';
 import { trackJsonParser, trackPayloadErrorHandler } from './routes/trackPayload.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -34,6 +37,14 @@ async function main() {
   const leaderboardManager = new LeaderboardManager(storage);
   
   const roomManager = new RoomManager(trackManager, leaderboardManager);
+
+  const profileManager = new ProfileManager(storage);
+  const nativeMatchManager = new NativeMatchManager(nativeOptionsFromEnv(), {
+    getTrack: id => trackManager.getTrack(id),
+    submitLapTime: (trackId, nickname, ms) => leaderboardManager.submitLapTime(trackId, nickname, ms),
+    submitRaceTime: (trackId, nickname, ms, laps) =>
+      leaderboardManager.submitRaceTime(trackId, nickname, ms, laps),
+  });
   
   // Create Express app
   const app = express();
@@ -50,6 +61,7 @@ async function main() {
   
   // API routes
   app.use('/api', createApiRoutes(trackManager, leaderboardManager, roomManager));
+  app.use('/api', createNativeApiRoutes(profileManager, nativeMatchManager));
   app.use(trackPayloadErrorHandler);
   
   // Serve static files in production
@@ -91,6 +103,7 @@ async function main() {
   process.on('SIGTERM', () => {
     console.log('SIGTERM received, shutting down...');
     roomManager.shutdown();
+    nativeMatchManager.shutdown();
     httpServer.close(() => {
       console.log('Server closed');
       process.exit(0);

@@ -16,6 +16,7 @@ export class StorageService {
       path.join(this.dataDir, 'tracks'),
       path.join(this.dataDir, 'leaderboards'),
       path.join(this.dataDir, 'replays'),
+      path.join(this.dataDir, 'profiles'),
     ];
 
     for (const dir of dirs) {
