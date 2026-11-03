@@ -10,6 +10,50 @@
 - [data](../data) stores track JSON, leaderboards, and replays. Preserve existing data; do not change it incidentally during validation.
 - Read [README.md](../README.md) for setup and deployment details. For track editor work, consult the [track-editor skill](skills/track-editor/SKILL.md) and [track documentation](../track.md).
 
+## Native game (C++)
+
+The browser game stays the primary experience. `native/` adds a Windows client and dedicated game servers that use the same web APIs. One CMake tree (C++17) builds these targets:
+
+- `cg_common` (`native/common`): shared static library, with no third-party dependencies.
+  - `json`, `log`: minimal JSON and leveled logging. Machine-readable stdout lines use `@@EVENT` (server) and `@@BOT` (bot) prefixes.
+  - `math2d`, `track`, `physics`: a deterministic port of `shared` physics and track loading at 60 Hz. State is quantized every tick so re-simulation matches the server. Changes to gameplay rules or constants must be made in both `shared` and `physics.cpp`.
+  - `protocol`: versioned little-endian UDP packets (magic `CG`, max 1400 bytes): Hello, Welcome, Reject, Input, Snapshot, Disconnect, Shutdown. Bump `kProtocolVersion` on incompatible changes.
+  - `net`: UDP sockets plus a network simulator (latency, jitter, loss) that can be changed at runtime.
+  - `clientnet`: client netcode.
+    - Prediction stamped with input ticks, with up to 16 redundant inputs per packet.
+    - Snapshot reconciliation by rewind and replay, with smoothed render corrections that snap above 200 px.
+    - Clock sync toward a server-reported input lead, adjusted with a ±8 % time scale or a hard resync.
+    - Lost-server detection.
+  - `http`, `lobbyapi`: minimal socket-based HTTP/1.1 client for the profile, track and lobby REST APIs.
+  - `racingline`, `botdriver`: AI driver used by server bots, `cg_bot`, and the client autopilot.
+- `cg_server` (`native/server`): authoritative match server, UDP port 5555 by default. Builds with MSVC and g++.
+  - It reads its match config (track, players with join tokens, bots, lap count, timeouts) from `--config file|-`.
+  - It runs waiting → countdown → racing → results → ended, then exits.
+  - It reports `@@EVENT` JSON lines (ready, joined, left, started, lap, result, ended, error) on stdout and logs to stderr.
+- `cg_bot` (`native/bot`): headless AI client for tests.
+  - Connects either directly or through the lobby API.
+  - Network conditions can change via `--script`/stdin.
+  - Prints a `@@BOT` summary; exit codes are 0 finished, 3 lost server, 4 not back in lobby.
+- `cg_client` (`native/client`, Windows only, `CG_BUILD_CLIENT`): D3D11 renderer, Direct2D/DirectWrite HUD, keyboard and XInput, a lobby flow on a worker thread, and the profile in `%APPDATA%\CarGameNative`.
+  - Debug keys: F3 network overlay, F4 ghosts, F5–F8 latency/jitter/loss, F9 autopilot.
+- Tests (`native/tests`, ctest): `unit`, `ai`, and `loopback` (server, 2 AI clients and a server bot in one process, with changing latency and a lost-server check).
+
+The Node server orchestrates native matches:
+
+- [server/profiles/profileManager.ts](../server/profiles/profileManager.ts): `/api/profiles` (nickname and color), stored in `data/profiles`.
+- [server/native/nativeMatchManager.ts](../server/native/nativeMatchManager.ts): in-memory native lobbies, the UDP port pool, and match launches.
+  - It spawns `cg_server` (`NATIVE_SERVER_PATH`) or `NATIVE_SERVER_COMMAND` (for example `docker run`), writes the config to stdin, and parses `@@EVENT` lines.
+  - Results go to the leaderboards.
+  - On crash, timeout, or exit, the lobby returns to `waiting` with a message.
+  - Use `killTree` so shell-wrapped processes stop too.
+- [server/routes/nativeApi.ts](../server/routes/nativeApi.ts): `/api/native/lobbies/*` and `/api/native/debug`. A running lobby exposes `connection {host, port, token, matchId}` only to the requesting profile.
+
+Conventions:
+
+- Keep `native/common`, the server, and the bot portable (Windows and POSIX). Windows-only code belongs in `native/client` or behind `_WIN32`.
+- Builds must stay warning-free under `/W4` and `-Wall -Wextra`.
+- Do not name other commercial games in code, comments, or docs.
+
 ## Development
 
 - Run commands from the repository root. Use `npm install` when dependencies need to be installed.
